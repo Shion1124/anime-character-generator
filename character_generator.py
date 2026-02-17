@@ -62,12 +62,22 @@ class AnimeCharacterGenerator:
         
         # スタイル定義
         self.styles = {
-            "with_hat": "wearing hat",
-            "with_earrings": "wearing earrings",
-            "formal": "formal dress, elegant",
-            "casual": "casual outfit",
-            "with_makeup": "with makeup, beautiful",
-            "glasses": "wearing glasses"
+            "with_hat": "wearing hat, stylish, fashionable",
+            "with_earrings": "wearing earrings, jewelry, elegant",
+            "with_makeup": "with makeup, beautiful, glamorous",
+            "formal": "wearing formal dress, elegant, professional",
+            "casual": "casual outfit, relaxed, friendly",
+            "long_hair": "long brown hair, soft flowing hair",
+            "blush": "soft blush on cheeks",
+            "fireplace": "warm fireplace in background",
+            "warm_lighting": "warm ambient lighting, soft orange glow",
+            "cozy_room": "cozy indoor setting",
+            "bokeh": "cinematic bokeh lights",
+            "portrait": "upper body portrait",
+            "depth_of_field": "shallow depth of field",
+            "high_detail": "highly detailed",
+            "soft_shading": "soft anime shading",
+            "masterpiece": "masterpiece, best quality"
         }
     
     def generate_image(
