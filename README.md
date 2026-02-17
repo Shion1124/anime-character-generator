@@ -184,7 +184,7 @@ image = pipe(
 **Shion Shinzaki**
 - GitHub: [@Shion1124](https://github.com/Shion1124)
 - Blog: [shion.blog](https://shion.blog/)
-- Email: yontheroads@gmail.com
+- Email: soundpoem2022@gmail.com
 
 ## 📄 License
 
