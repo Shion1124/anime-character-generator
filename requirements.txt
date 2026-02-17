@@ -1,0 +1,9 @@
+torch>=2.0.0
+torchvision>=0.15.0
+diffusers>=0.21.0
+transformers>=4.34.0
+accelerate>=0.24.0
+safetensors>=0.4.0
+pillow>=10.0.0
+matplotlib>=3.8.0
+peft>=0.7.0
