@@ -7,7 +7,9 @@ Stable Diffusion + PyTorch を活用した、**アニメキャラクター自動
 このプロジェクトは、Text-to-Image生成モデルの実践的な実装を通じて、以下を実現します：
 
 - ✅ **感情バリエーション生成**：Happy, Angry, Sad, Surprised（4パターン）
-- ✅ **スタイルバリエーション生成**：Hat, Earrings, Formal, Casual, Makeup, Glasses（6パターン）
+- ✅ **スタイルバリエーション生成**：Hat, Earrings, Makeup, Formal, Casual, Long Hair, Blush他（16パターン）
+- ✅ **グリッド合成出力**：emotion_results_v*.png（2x2）、style_results_v*.png（2x4）で効率的に一覧表示
+- ✅ **自動バージョン管理**：実行するたびに v1 → v2 → v3 と自動的にバージョン番号を追加
 - ✅ **高品質アニメ風画像**：512×512px、マスターピースクオリティ
 
 ## 🛠️ 技術スタック
@@ -100,18 +102,21 @@ anime-character-generator/
 ├── anime_generator_colab.ipynb        # 詳細版ノートブック
 ├── character_generator.py             # プロダクション版スクリプト
 ├── outputs/
-│   ├── emotions/                      # 感情バリエーション画像
+│   ├── emotion_results_v1.png         # 感情グリッド合成（2x2）
+│   ├── emotion_results_v2.png         # 自動バージョン管理
+│   ├── style_results_v1.png           # スタイルグリッド合成（2x4）
+│   ├── style_results_v2.png           # 自動バージョン管理
+│   ├── emotions/                      # 個別感情バリエーション画像
 │   │   ├── character_happy.png
 │   │   ├── character_angry.png
 │   │   ├── character_sad.png
 │   │   └── character_surprised.png
-│   └── styles/                        # スタイルバリエーション画像
+│   └── styles/                        # 個別スタイルバリエーション画像（16パターン）
 │       ├── character_with_hat.png
 │       ├── character_with_earrings.png
-│       ├── character_formal.png
-│       ├── character_casual.png
 │       ├── character_with_makeup.png
-│       └── character_glasses.png
+│       ├── ...
+│       └── character_masterpiece.png
 └── .gitignore
 ```
 
@@ -133,14 +138,35 @@ anime-character-generator/
 
 ### プロンプト修正
 
-`anime_generator_colab_simple.ipynb` Step 5-6の辞書を編集：
+`anime_generator_colab_simple.ipynb` Step 5-6 や `character_generator.py` の辞書を編集：
 
 ```python
 emotions = {
-    "cool": "cool expression, confident, serious",
-    "shy": "shy expression, blushing, cute",
+    "happy": "happy smile, cheerful, joyful",
+    "angry": "angry expression, intense eyes",
     # さらに追加...
 }
+
+styles = {
+    "with_hat": "wearing hat, stylish, fashionable",
+    "formal": "wearing formal dress, elegant, professional",
+    # 16パターンから自分好みに編集可能...
+}
+```
+
+### グリッド合成のカスタマイズ
+
+```python
+# character_generator.py の generate_all() で調整可能
+
+# 感情グリッド：2行2列（デフォルト）
+self._create_grid_composite(emotion_images, "emotion_results", rows=2, cols=2)
+
+# スタイルグリッド：2行4列（デフォルト）
+self._create_grid_composite(style_images, "style_results", rows=2, cols=4)
+
+# カスタマイズ例：4行4列グリッド
+self._create_grid_composite(images, "custom_results", rows=4, cols=4, gap=15)
 ```
 
 ### 生成パラメータ調整
