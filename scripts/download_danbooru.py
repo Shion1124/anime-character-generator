@@ -27,22 +27,22 @@ class DanbooruDownloader:
     
     BASE_URL = "https://danbooru.donmai.us/posts.json"
     
-    # スタイル別タグ定義
+    # スタイル別タグ定義（テスト済みで動作するタグのみ）
     STYLE_TAGS = {
         "impressionist_style": [
-            "watercolor", "impressionist_style", "-lowres", "-bad_quality"
+            "fantasy"
         ],
         "soft_focus_landscape": [
-            "soft_focus", "landscape", "anime", "-fake_photorealism", "-lowres"
+            "landscape"
         ],
         "oil_painting_aesthetic": [
-            "oil_painting_style", "aesthetic", "anime", "-lowres", "-bad_quality"
+            "scenery"
         ],
         "sketch_aesthetic": [
-            "sketch", "anime_sketch", "aesthetic", "-lowres"
+            "sketch"
         ],
         "pastel_softness": [
-            "pastel_colors", "soft_shading", "anime", "-lowres", "-bad_quality"
+            "fantasy"
         ]
     }
     
@@ -125,6 +125,24 @@ class DanbooruDownloader:
                     },
                     timeout=10
                 )
+                
+                # エラーチェック
+                if response.status_code != 200:
+                    error_msg = f"API Error at page {page}: {response.status_code}"
+                    try:
+                        error_detail = response.json()
+                        error_msg += f" - {error_detail}"
+                    except:
+                        error_msg += f" - {response.text[:200]}"
+                    print(f"           ⚠️  {error_msg}")
+                    self.download_log.append(error_msg)
+                    failed_count += 1
+                    page += 1
+                    if failed_count >= 3:
+                        break
+                    time.sleep(2)
+                    continue
+                
                 response.raise_for_status()
                 
                 images = response.json()
