@@ -31,11 +31,11 @@ import traceback
 
 # 条件付きインポート（環境依存）
 try:
-    from diffusers import StableDiffusionPipeline, DDPMScheduler
-    from transformers import CLIPTokenizer
-    from peft import LoraConfig
-    from peft.tuners import inject_adapter_in_model
-    from accelerate import Accelerator
+    from diffusers import StableDiffusionPipeline, DDPMScheduler, AutoencoderKL, UNet2DConditionModel
+    from diffusers.models.attention_processor import LoRAAttnProcessor, LoRAAttnProcessor2_0
+    from diffusers.loaders import AttnProcsLayers
+    from transformers import CLIPTokenizer, CLIPTextModel
+    from safetensors.torch import save_file
     IMPORTS_SUCCESS = True
 except ImportError as e:
     print(f"⚠️  Some imports failed. Will attempt installation: {e}")
@@ -152,39 +152,57 @@ class LoRATrainer:
         self._setup_model()
     
     def _setup_model(self):
-        """モデル・LoRA 設定の初期化"""
+        """モデル・LoRA 設定の初期化 (diffusers ネイティブ LoRA)"""
         
         try:
             print("\n📥 Loading Stable Diffusion v1.5...")
+            dtype = torch.float16 if "cuda" in self.device else torch.float32
             
-            # パイプライン作成
-            self.pipe = StableDiffusionPipeline.from_pretrained(
-                self.model_id,
-                torch_dtype=torch.float16 if "cuda" in self.device else torch.float32
-            )
-            self.pipe = self.pipe.to(self.device)
+            # 各コンポーネントを個別にロード
+            self.tokenizer = CLIPTokenizer.from_pretrained(self.model_id, subfolder="tokenizer")
+            self.text_encoder = CLIPTextModel.from_pretrained(self.model_id, subfolder="text_encoder", torch_dtype=dtype).to(self.device)
+            self.vae = AutoencoderKL.from_pretrained(self.model_id, subfolder="vae", torch_dtype=dtype).to(self.device)
+            self.unet = UNet2DConditionModel.from_pretrained(self.model_id, subfolder="unet", torch_dtype=dtype).to(self.device)
             
-            # テキストエンコーダーを取得
-            self.text_encoder = self.pipe.text_encoder
-            self.unet = self.pipe.unet
-            self.tokenizer = self.pipe.tokenizer
+            # VAE とテキストエンコーダーは凍結
+            self.vae.requires_grad_(False)
+            self.text_encoder.requires_grad_(False)
+            self.unet.requires_grad_(False)
             
-            # LoRA 設定
-            # 注: get_peft_model ではなく inject_adapter_in_model を使用
-            # get_peft_model は task_type マッピングを使用するため、拡散モデルには適していない
-            lora_config = LoraConfig(
-                r=self.lora_rank,
-                lora_alpha=self.lora_alpha,
-                target_modules=["to_k", "to_v", "to_q"],
-                lora_dropout=0.1,
-                bias="none"
-            )
+            # diffusers ネイティブ LoRA アテンションプロセッサを設定
+            # PEFT の task_type 依存を一切使わないアプローチ
+            unet_attn_procs = {}
+            for name in self.unet.attn_processors.keys():
+                cross_attention_dim = (
+                    None
+                    if name.endswith("attn1.processor")
+                    else self.unet.config.cross_attention_dim
+                )
+                if name.startswith("mid_block"):
+                    hidden_size = self.unet.config.block_out_channels[-1]
+                elif name.startswith("up_blocks"):
+                    block_id = int(name[len("up_blocks.")])
+                    hidden_size = list(reversed(self.unet.config.block_out_channels))[block_id]
+                elif name.startswith("down_blocks"):
+                    block_id = int(name[len("down_blocks.")])
+                    hidden_size = self.unet.config.block_out_channels[block_id]
+                else:
+                    hidden_size = self.unet.config.block_out_channels[0]
+                
+                unet_attn_procs[name] = LoRAAttnProcessor(
+                    hidden_size=hidden_size,
+                    cross_attention_dim=cross_attention_dim,
+                    rank=self.lora_rank
+                ).to(dtype=dtype, device=self.device)
             
-            # LoRA を U-Net に直接注入（task_type マッピングをバイパス）
-            self.unet = inject_adapter_in_model(self.unet, lora_config)
-            self.unet = self.unet.to(self.device)
+            self.unet.set_attn_processor(unet_attn_procs)
             
-            print("✅ Model loaded and LoRA configured")
+            # 学習対象パラメータ: LoRA レイヤーのみ
+            self.lora_layers = AttnProcsLayers(self.unet.attn_processors)
+            
+            lora_params = sum(p.numel() for p in self.lora_layers.parameters())
+            print(f"✅ LoRA configured: {lora_params:,} trainable params")
+            print(f"✅ Model loaded and LoRA configured (diffusers native)")
             
         except Exception as e:
             print(f"❌ Error setting up model: {e}")
@@ -228,9 +246,9 @@ class LoRATrainer:
                 num_workers=num_workers
             )
             
-            # オプティマイザー設定
+            # オプティマイザー設定 (LoRA レイヤーのみ)
             optimizer = torch.optim.AdamW(
-                self.unet.parameters(),
+                self.lora_layers.parameters(),
                 lr=learning_rate
             )
             
@@ -245,8 +263,10 @@ class LoRATrainer:
                 self.model_id, subfolder="scheduler"
             )
             
-            # トレーニングループ
+            # トレーニングループ（LoRA レイヤーのみ学習モード）
             self.unet.train()
+            self.vae.eval()
+            self.text_encoder.eval()
             
             training_log = {
                 "config": {
@@ -271,9 +291,10 @@ class LoRATrainer:
                 for batch_idx, batch in enumerate(pbar):
                     # プロンプトをトークン化
                     prompts = batch["prompt"]
-                    pixel_values = batch["pixel_values"].to(self.device)
+                    dtype = torch.float16 if "cuda" in self.device else torch.float32
+                    pixel_values = batch["pixel_values"].to(device=self.device, dtype=dtype)
                     
-                    # テキストエンコード
+                    # テキストエンコード & VAE エンコード（勾配不要）
                     with torch.no_grad():
                         input_ids = self.tokenizer(
                             prompts,
@@ -284,17 +305,22 @@ class LoRATrainer:
                         ).input_ids.to(self.device)
                         
                         encoder_hidden_states = self.text_encoder(input_ids)[0]
+                        
+                        # 画像を潜在空間にエンコード（UNet は潜在変数を受け取る）
+                        latents = self.vae.encode(pixel_values).latent_dist.sample()
+                        latents = latents * self.vae.config.scaling_factor
                     
                     # ノイズサンプリング
-                    noise = torch.randn_like(pixel_values)
+                    noise = torch.randn_like(latents)
                     timesteps = torch.randint(
                         0, noise_scheduler.config.num_train_timesteps,
-                        (pixel_values.shape[0],)
-                    ).to(self.device)
+                        (latents.shape[0],),
+                        device=self.device
+                    ).long()
                     
                     # ノイズが追加された潜在表現
                     noisy_latents = noise_scheduler.add_noise(
-                        pixel_values, noise, timesteps
+                        latents, noise, timesteps
                     )
                     
                     # U-Net 予測
@@ -310,7 +336,7 @@ class LoRATrainer:
                     # バックプロップ
                     optimizer.zero_grad()
                     loss.backward()
-                    torch.nn.utils.clip_grad_norm_(self.unet.parameters(), 1.0)
+                    torch.nn.utils.clip_grad_norm_(self.lora_layers.parameters(), 1.0)
                     optimizer.step()
                     lr_scheduler.step()
                     
@@ -318,7 +344,7 @@ class LoRATrainer:
                     global_step += 1
                     
                     pbar.update(1)
-                    pbar.set_postfix({"loss": loss.item()})
+                    pbar.set_postfix({"loss": f"{loss.item():.6f}"})
                 
                 avg_loss = epoch_loss / len(dataloader)
                 training_log["history"].append({
@@ -356,7 +382,9 @@ class LoRATrainer:
         checkpoint_dir = self.output_dir / f"checkpoint-{epoch}"
         checkpoint_dir.mkdir(exist_ok=True)
         
-        self.unet.save_pretrained(checkpoint_dir)
+        # LoRA レイヤーの重みを safetensors で保存
+        state_dict = self.lora_layers.state_dict()
+        save_file(state_dict, checkpoint_dir / "lora_weights.safetensors")
         print(f"  💾 Checkpoint saved: {checkpoint_dir}")
     
     def save_lora_weights(self, filename: str = "anime-impressionist-lora.safetensors"):
@@ -369,20 +397,24 @@ class LoRATrainer:
         save_path = self.output_dir / filename
         
         try:
-            # U-Net の LoRA 重みのみ保存
-            self.unet.save_pretrained(
-                self.output_dir,
-                safe_serialization=True
-            )
-            
-            # ファイルを適切なファイル名にリネーム
-            import shutil
-            default_path = self.output_dir / "adapter_model.safetensors"
-            if default_path.exists():
-                shutil.move(str(default_path), str(save_path))
+            # LoRA アテンションプロセッサの重みのみ抽出して保存
+            state_dict = self.lora_layers.state_dict()
+            save_file(state_dict, save_path)
             
             file_size_mb = save_path.stat().st_size / (1024 * 1024)
             print(f"✅ LoRA weights saved: {save_path} ({file_size_mb:.2f} MB)")
+            
+            # adapter_config.json も保存（互換性のため）
+            import json as _json
+            config = {
+                "base_model_name_or_path": self.model_id,
+                "lora_rank": self.lora_rank,
+                "lora_alpha": self.lora_alpha,
+                "target_modules": ["to_k", "to_v", "to_q", "to_out.0"],
+                "peft_type": "LORA"
+            }
+            with open(self.output_dir / "adapter_config.json", "w") as f:
+                _json.dump(config, f, indent=2)
             
             return save_path
         
