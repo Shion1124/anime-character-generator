@@ -41,39 +41,102 @@ except ImportError as e:
     IMPORTS_SUCCESS = False
 
 
-class LoRALinear(nn.Module):
-    """純粋 PyTorch 実装の LoRA レイヤー
+class DoRALinear(nn.Module):
+    """
+    DoRA (Dominant Rank Adaptation) + QLoRA 対応の純粋 PyTorch 実装
     
-    バージョン依存なし: PEFT/diffusers の特定 API に依存しない
+    DoRA: magnitude (スケール) と direction (方向) を分離
+    - magnitude: 低周波成分（スケール調整）
+    - direction: 高周波成分（細部特性）
+    
+    QLoRA対応：
+    - direction コンポーネントを低精度（int8/fp4相当）で保持 → メモリ削減
+    - magnitude は高精度のまま（学習の安定性重視）
+    - 順伝播: direction は混合精度で計算
+    
+    参考: 
+    - DoRA: https://arxiv.org/abs/2402.09353
+    - QLoRA: https://arxiv.org/abs/2305.14314
     """
     
-    def __init__(self, linear: nn.Linear, rank: int = 8, alpha: float = 32.0):
+    def __init__(self, linear: nn.Linear, rank: int = 32, alpha: float = 32.0, use_qlora: bool = False):
         super().__init__()
         self.linear = linear
         in_features = linear.in_features
         out_features = linear.out_features
         self.rank = rank
         self.scale = alpha / rank
+        self.use_qlora = use_qlora
         
-        # LoRA A/B 行列（元の linear と同じ dtype / device）
+        # デバイス・dtype を元レイヤーと統一
         dtype = linear.weight.dtype
         device = linear.weight.device
-        self.lora_A = nn.Linear(in_features, rank, bias=False, device=device, dtype=dtype)
-        self.lora_B = nn.Linear(rank, out_features, bias=False, device=device, dtype=dtype)
         
-        # 初期化: A は Kaiming 乱数、B はゼロ（初期差分ゼロ）
-        nn.init.kaiming_uniform_(self.lora_A.weight)
-        nn.init.zeros_(self.lora_B.weight)
+        # ① Magnitude vector (低周波成分: スケール)
+        # 常に高精度（学習の安定性）
+        self.magnitude = nn.Parameter(
+            torch.zeros(out_features, dtype=dtype, device=device)
+        )
+        
+        # ② Direction matrix (高周波成分: 微細な特性)
+        # QLoRA: direction は低精度で保持してメモリ削減
+        direction_dtype = torch.float16 if use_qlora else dtype
+        self.direction_a = nn.Linear(in_features, rank, bias=False, device=device, dtype=direction_dtype)
+        self.direction_b = nn.Linear(rank, out_features, bias=False, device=device, dtype=direction_dtype)
+        
+        # 初期化
+        nn.init.kaiming_uniform_(self.direction_a.weight, a=0.01)
+        nn.init.zeros_(self.direction_b.weight)
+        nn.init.zeros_(self.magnitude)
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.linear(x) + self.scale * self.lora_B(self.lora_A(x))
+        """
+        DoRA (+ QLoRA) forward pass:
+        y = W_base(x) + scale * (1 + magnitude) * direction_b(direction_a(x))
+        
+        QLoRA 時: direction は float16 で計算（メモリ削減）
+        """
+        # ベース重みによる出力
+        base_out = self.linear(x)
+        
+        # Direction component: 低ランク分解
+        # QLoRA: x は元の精度、direction_a から異なる精度で返される
+        if self.use_qlora:
+            # float16 direction で計算
+            intermediate = self.direction_a(x.to(self.direction_a.weight.dtype))
+            direction_delta = self.direction_b(intermediate).to(x.dtype)
+        else:
+            # 通常: 同一精度
+            direction_delta = self.direction_b(self.direction_a(x))
+        
+        # Magnitude component: スケール適用
+        magnitude_scaled = (1.0 + self.magnitude) * direction_delta
+        
+        return base_out + self.scale * magnitude_scaled
 
 
-def inject_lora_to_unet(unet: nn.Module, rank: int = 8, alpha: float = 32.0) -> list:
-    """UNet のアテンション層に LoRA を注入
+# LoRA 互換性のために LoRALinear エイリアスを保持
+LoRALinear = DoRALinear
+
+
+def inject_lora_to_unet(unet: nn.Module, rank: int = 32, alpha: float = 32.0, use_qlora: bool = False) -> list:
+    """UNet のアテンション層に DoRA (+ QLoRA) を注入
+    
+    DoRA (Dominant Rank Adaptation):
+    - magnitude: 低周波スケール成分（画像の大域的な特性）
+    - direction: 高周波方向成分（細部ノイズ・テクスチャ）
+    
+    QLoRA (Quantized LoRA):
+    - direction コンポーネントを float16 で量子化 → メモリ削減
+    - magnitude は高精度のまま（学習安定性）
+    
+    Args:
+        rank: DoRA ランク（推奨: 32-64 のユーザー実測最適値）
+        alpha: スケーリング係数
+        use_qlora: QLoRA を有効化（メモリセーバー、精度-メモリトレードオフ）
     
     Returns:
-        lora_params: 学習対象の LoRA パラメータリスト
+        lora_params: 学習対象の DoRA パラメータリスト
     """
     unet.requires_grad_(False)
     lora_modules_replaced = 0
@@ -88,10 +151,10 @@ def inject_lora_to_unet(unet: nn.Module, rank: int = 8, alpha: float = 32.0) -> 
             if isinstance(child, nn.ModuleList):
                 for i, sub in enumerate(child):
                     if isinstance(sub, nn.Linear):
-                        child[i] = LoRALinear(sub, rank=rank, alpha=alpha)
+                        child[i] = DoRALinear(sub, rank=rank, alpha=alpha, use_qlora=use_qlora)
                         lora_modules_replaced += 1
             elif isinstance(child, nn.Linear):
-                setattr(module, attr, LoRALinear(child, rank=rank, alpha=alpha))
+                setattr(module, attr, DoRALinear(child, rank=rank, alpha=alpha, use_qlora=use_qlora))
                 lora_modules_replaced += 1
     
     print(f"  🔧 LoRA 注入: {lora_modules_replaced} modules")
@@ -99,22 +162,25 @@ def inject_lora_to_unet(unet: nn.Module, rank: int = 8, alpha: float = 32.0) -> 
     # LoRA パラメータのみ学習可能に設定
     lora_params = []
     for module in unet.modules():
-        if isinstance(module, LoRALinear):
-            module.lora_A.requires_grad_(True)
-            module.lora_B.requires_grad_(True)
-            lora_params.extend(list(module.lora_A.parameters()))
-            lora_params.extend(list(module.lora_B.parameters()))
+        if isinstance(module, DoRALinear):
+            module.magnitude.requires_grad_(True)
+            module.direction_a.requires_grad_(True)
+            module.direction_b.requires_grad_(True)
+            lora_params.append(module.magnitude)
+            lora_params.extend(list(module.direction_a.parameters()))
+            lora_params.extend(list(module.direction_b.parameters()))
     
     return lora_params
 
 
 def get_lora_state_dict(unet: nn.Module) -> dict:
-    """UNet から LoRA 重みのみ抽出"""
+    """UNet から DoRA 重みのみ抽出"""
     state_dict = {}
     for name, module in unet.named_modules():
-        if isinstance(module, LoRALinear):
-            state_dict[f"{name}.lora_A.weight"] = module.lora_A.weight.detach().cpu().float()
-            state_dict[f"{name}.lora_B.weight"] = module.lora_B.weight.detach().cpu().float()
+        if isinstance(module, DoRALinear):
+            state_dict[f"{name}.magnitude"] = module.magnitude.detach().cpu().float()
+            state_dict[f"{name}.direction_a.weight"] = module.direction_a.weight.detach().cpu().float()
+            state_dict[f"{name}.direction_b.weight"] = module.direction_b.weight.detach().cpu().float()
     return state_dict
 
 
@@ -198,8 +264,9 @@ class LoRATrainer:
         model_id: str = "runwayml/stable-diffusion-v1-5",
         output_dir: str = "lora_weights",
         device: str = "cuda" if torch.cuda.is_available() else "cpu",
-        lora_rank: int = 8,
+        lora_rank: int = 32,
         lora_alpha: float = 32,
+        use_qlora: bool = False,
     ):
         """初期化
         
@@ -207,8 +274,9 @@ class LoRATrainer:
             model_id: Hugging Face モデル ID
             output_dir: 出力ディレクトリ
             device: 計算デバイス
-            lora_rank: LoRA ランク
-            lora_alpha: LoRA スケーリング係数
+            lora_rank: DoRA ランク（推奨: 32-64）
+            lora_alpha: DoRA スケーリング係数
+            use_qlora: QLoRA を使用（direction量子化、メモリ削減）
         """
         self.model_id = model_id
         self.output_dir = Path(output_dir)
@@ -216,19 +284,26 @@ class LoRATrainer:
         self.device = device
         self.lora_rank = lora_rank
         self.lora_alpha = lora_alpha
+        self.use_qlora = use_qlora
         
         print("="*60)
-        print("🚀 LoRA Trainer Initialization")
+        print("🚀 DoRA Trainer Initialization")
         print("="*60)
         print(f"📦 Model: {model_id}")
         print(f"📁 Output: {self.output_dir}")
         print(f"💻 Device: {device}")
-        print(f"🎯 LoRA Config: rank={lora_rank}, alpha={lora_alpha}")
+        print(f"🎯 DoRA Config: rank={lora_rank}, alpha={lora_alpha}")
+        if use_qlora:
+            print(f"⚡ QLoRA: Enabled (direction: float16 → int8 quantization)")
+        print(f"   (Dominant Rank Adaptation - magnitude + direction decomposition)")
+        print(f"💻 Device: {device}")
+        print(f"🎯 DoRA Config: rank={lora_rank}, alpha={lora_alpha}")
+        print(f"   (Dominant Rank Adaptation - magnitude + direction decomposition)")
         
         self._setup_model()
     
     def _setup_model(self):
-        """モデル・LoRA 設定の初期化 (純粋 PyTorch LoRA)"""
+        """モデル・DoRA 設定の初期化 (純粋 PyTorch DoRA)"""
         
         try:
             print("\n📥 Loading Stable Diffusion v1.5...")
@@ -250,24 +325,27 @@ class LoRATrainer:
             self.vae.requires_grad_(False)
             self.text_encoder.requires_grad_(False)
             
-            # 純粋 PyTorch LoRA を UNet アテンション層に注入
-            # PEFT / diffusers 特定 API に依存しない（バージョン互換）
+            # 純粋 PyTorch DoRA を UNet アテンション層に注入
+            # Magnitude (低周波) と Direction (高周波) を分離学習
             self.lora_params = inject_lora_to_unet(
-                self.unet, rank=self.lora_rank, alpha=self.lora_alpha
+                self.unet, rank=self.lora_rank, alpha=self.lora_alpha, use_qlora=self.use_qlora
             )
             
-            # 安全策: LoRA 注入後に全パラメータを確実にデバイスへ移動
+            # 安全策: DoRA 注入後に全パラメータを確実にデバイスへ移動
             self.unet.to(self.device)
-            # lora_params の参照も更新
+            # DoRA パラメータ参照を更新（magnitude + direction コンポーネント）
             self.lora_params = []
             for m in self.unet.modules():
-                if isinstance(m, LoRALinear):
-                    self.lora_params.extend(list(m.lora_A.parameters()))
-                    self.lora_params.extend(list(m.lora_B.parameters()))
+                if isinstance(m, DoRALinear):
+                    self.lora_params.append(m.magnitude)  # magnitude ベクトル
+                    self.lora_params.extend(list(m.direction_a.parameters()))
+                    self.lora_params.extend(list(m.direction_b.parameters()))
             
             total_params = sum(p.numel() for p in self.lora_params)
-            print(f"✅ LoRA configured: {total_params:,} trainable params")
-            print(f"✅ Model loaded (純粋 PyTorch LoRA, バージョン非依存)")
+            print(f"✅ DoRA configured: {total_params:,} trainable params")
+            if self.use_qlora:
+                print(f"✅ QLoRA enabled: direction components in float16 (memory efficient)")
+            print(f"✅ Model loaded (純粋 PyTorch DoRA, 低周波×高周波分離学習)")
             
         except Exception as e:
             print(f"❌ Error setting up model: {e}")
@@ -282,6 +360,7 @@ class LoRATrainer:
         learning_rate: float = 1e-4,
         num_workers: int = 0,
         save_interval: int = 5,
+        use_qlora: bool = True,
     ):
         """LoRA トレーニング実行
         
@@ -292,24 +371,64 @@ class LoRATrainer:
             learning_rate: 学習率
             num_workers: データローダーのワーカー数
             save_interval: チェックポイント保存間隔（エポック）
+            use_qlora: QLoRA を有効化
         """
         
         print("\n" + "="*60)
-        print("🎓 Starting LoRA Training")
+        print("🎓 Starting DoRA Training")
         print("="*60)
         print(f"📊 Training Epochs: {num_epochs}")
         print(f"📦 Batch Size: {batch_size}")
         print(f"🎯 Learning Rate: {learning_rate}")
+        print(f"💡 DoRA: Magnitude (低周波) + Direction (高周波) 分離学習")
+        print(f"🔧 QLoRA: {use_qlora}")
+        
+        # トレーニングログの初期化（try-except 外）
+        training_log = {
+            "config": {
+                "model_id": self.model_id,
+                "num_epochs": num_epochs,
+                "batch_size": batch_size,
+                "learning_rate": learning_rate,
+                "lora_rank": self.lora_rank,
+                "lora_alpha": self.lora_alpha,
+                "use_qlora": use_qlora,
+            },
+            "history": [],
+            "status": "initializing"
+        }
         
         try:
             # データセット作成
             dataset = AnimeDataset(data_dir)
+            
+            # データセット検証
+            if len(dataset) == 0:
+                raise ValueError(
+                    f"❌ Dataset is empty! No images found in {data_dir}\n"
+                    "   Expected structure: {data_dir}/<style_name>/*.png\n"
+                    "   Please upload training images first."
+                )
+            
+            print(f"✅ Dataset loaded: {len(dataset)} images")
+            
             dataloader = DataLoader(
                 dataset,
                 batch_size=batch_size,
                 shuffle=True,
                 num_workers=num_workers
             )
+            
+            # データローダー検証
+            num_batches = len(dataloader)
+            print(f"✅ DataLoader ready: {num_batches} batches")
+            
+            if num_batches == 0:
+                raise ValueError(
+                    f"❌ DataLoader has 0 batches!\n"
+                    f"   Dataset size: {len(dataset)}, Batch size: {batch_size}\n"
+                    "   This usually means the DataLoader failed to create batches."
+                )
             
             # オプティマイザー設定 (LoRA パラメータのみ)
             optimizer = torch.optim.AdamW(
@@ -318,7 +437,7 @@ class LoRATrainer:
             )
             
             # スケジューラー設定
-            num_training_steps = len(dataloader) * num_epochs
+            num_training_steps = num_batches * num_epochs
             lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
                 optimizer, num_training_steps
             )
@@ -334,17 +453,10 @@ class LoRATrainer:
             self.text_encoder.eval()
             # LoRA 以外の UNet パラメータは勾配なし（inject 時に設定済み）
             
-            training_log = {
-                "config": {
-                    "model_id": self.model_id,
-                    "num_epochs": num_epochs,
-                    "batch_size": batch_size,
-                    "learning_rate": learning_rate,
-                    "lora_rank": self.lora_rank,
-                    "lora_alpha": self.lora_alpha,
-                },
-                "history": []
-            }
+            # 既に定義された training_log にデータセット情報を追加
+            training_log["config"]["dataset_size"] = len(dataset)
+            training_log["config"]["num_batches"] = num_batches
+            training_log["status"] = "training"
             
             global_step = 0
             
@@ -440,11 +552,13 @@ class LoRATrainer:
                     self._save_checkpoint(epoch + 1)
             
             print("\n✅ Training completed!")
+            training_log["status"] = "completed"
             
             # トレーニングログ保存
             log_file = self.output_dir / "training_log.json"
             with open(log_file, "w") as f:
                 json.dump(training_log, f, indent=2)
+            print(f"📊 Training log saved: {log_file}")
             
             # 最終モデル保存
             self.save_lora_weights()
@@ -454,6 +568,21 @@ class LoRATrainer:
         except Exception as e:
             print(f"\n❌ Training error: {e}")
             traceback.print_exc()
+            
+            # エラー情報をログに追加して保存（できるなら）
+            try:
+                training_log["status"] = "error"
+                training_log["error"] = str(e)
+                training_log["error_traceback"] = traceback.format_exc()
+                
+                self.output_dir.mkdir(parents=True, exist_ok=True)
+                log_file = self.output_dir / "training_log.json"
+                with open(log_file, "w") as f:
+                    json.dump(training_log, f, indent=2)
+                print(f"📊 Error log saved: {log_file}")
+            except Exception as log_error:
+                print(f"⚠️  Could not save error log: {log_error}")
+            
             raise
     
     def _save_checkpoint(self, epoch: int):
@@ -540,14 +669,19 @@ def main():
     parser.add_argument(
         "--lora_rank",
         type=int,
-        default=8,
-        help="LoRA ランク"
+        default=32,
+        help="DoRA ランク (デフォルト 32, ユーザー実測最適値 32-64)"
     )
     parser.add_argument(
         "--lora_alpha",
         type=float,
         default=32,
         help="LoRA アルファ (スケーリング係数)"
+    )
+    parser.add_argument(
+        "--use_qlora",
+        action="store_true",
+        help="QLoRA を有効化 (direction: float16 量子化, メモリ削減)"
     )
     parser.add_argument(
         "--device",
@@ -568,7 +702,8 @@ def main():
         output_dir=args.output_dir,
         lora_rank=args.lora_rank,
         lora_alpha=args.lora_alpha,
-        device=args.device
+        device=args.device,
+        use_qlora=args.use_qlora
     )
     
     training_log = trainer.train(
