@@ -333,6 +333,12 @@ class LoRATrainer:
             
             # 安全策: DoRA 注入後に全パラメータを確実にデバイスへ移動
             self.unet.to(self.device)
+            
+            # Gradient Checkpointing 有効化（VRAM 節約）
+            if "cuda" in self.device:
+                self.unet.enable_gradient_checkpointing()
+                print("✅ Gradient checkpointing enabled (VRAM 節約)")
+            
             # DoRA パラメータ参照を更新（magnitude + direction コンポーネント）
             self.lora_params = []
             for m in self.unet.modules():
@@ -361,6 +367,7 @@ class LoRATrainer:
         num_workers: int = 0,
         save_interval: int = 5,
         use_qlora: bool = True,
+        gradient_accumulation_steps: int = 1,
     ):
         """LoRA トレーニング実行
         
@@ -372,6 +379,7 @@ class LoRATrainer:
             num_workers: データローダーのワーカー数
             save_interval: チェックポイント保存間隔（エポック）
             use_qlora: QLoRA を有効化
+            gradient_accumulation_steps: 勾配蓄積ステップ数（実効バッチ = batch_size * steps）
         """
         
         print("\n" + "="*60)
@@ -379,9 +387,13 @@ class LoRATrainer:
         print("="*60)
         print(f"📊 Training Epochs: {num_epochs}")
         print(f"📦 Batch Size: {batch_size}")
+        print(f"📦 Gradient Accumulation: {gradient_accumulation_steps} steps (effective batch={batch_size * gradient_accumulation_steps})")
         print(f"🎯 Learning Rate: {learning_rate}")
         print(f"💡 DoRA: Magnitude (低周波) + Direction (高周波) 分離学習")
         print(f"🔧 QLoRA: {use_qlora}")
+        use_amp = "cuda" in self.device
+        if use_amp:
+            print(f"⚡ Mixed Precision (AMP): Enabled")
         
         # トレーニングログの初期化（try-except 外）
         training_log = {
@@ -389,10 +401,13 @@ class LoRATrainer:
                 "model_id": self.model_id,
                 "num_epochs": num_epochs,
                 "batch_size": batch_size,
+                "gradient_accumulation_steps": gradient_accumulation_steps,
+                "effective_batch_size": batch_size * gradient_accumulation_steps,
                 "learning_rate": learning_rate,
                 "lora_rank": self.lora_rank,
                 "lora_alpha": self.lora_alpha,
                 "use_qlora": use_qlora,
+                "mixed_precision": use_amp,
             },
             "history": [],
             "status": "initializing"
@@ -453,6 +468,9 @@ class LoRATrainer:
             self.text_encoder.eval()
             # LoRA 以外の UNet パラメータは勾配なし（inject 時に設定済み）
             
+            # Mixed Precision (AMP) 設定
+            scaler = torch.amp.GradScaler("cuda", enabled=use_amp) if use_amp else None
+            
             # 既に定義された training_log にデータセット情報を追加
             training_log["config"]["dataset_size"] = len(dataset)
             training_log["config"]["num_batches"] = num_batches
@@ -463,6 +481,7 @@ class LoRATrainer:
             for epoch in range(num_epochs):
                 print(f"\n[Epoch {epoch + 1}/{num_epochs}]")
                 epoch_loss = 0.0
+                num_valid_batches = 0
                 
                 pbar = tqdm(dataloader, desc="Training", leave=False)
                 
@@ -488,6 +507,9 @@ class LoRATrainer:
                         latents = self.vae.encode(pixel_values).latent_dist.sample()
                         latents = latents * self.vae.config.scaling_factor
                     
+                    # VAE 出力後に中間テンソルを解放
+                    del pixel_values, input_ids
+                    
                     # ノイズサンプリング
                     noise = torch.randn_like(latents)
                     timesteps = torch.randint(
@@ -501,15 +523,23 @@ class LoRATrainer:
                         latents, noise, timesteps
                     )
                     
-                    # U-Net 予測
-                    model_pred = self.unet(
-                        noisy_latents,
-                        timesteps,
-                        encoder_hidden_states
-                    ).sample
-                    
-                    # 損失計算（ノイズ予測）
-                    loss = torch.nn.functional.mse_loss(model_pred, noise)
+                    # U-Net 予測 (AMP autocast で forward pass を float16 計算)
+                    if use_amp:
+                        with torch.amp.autocast("cuda", dtype=torch.float16):
+                            model_pred = self.unet(
+                                noisy_latents,
+                                timesteps,
+                                encoder_hidden_states
+                            ).sample
+                            # 損失計算（ノイズ予測）
+                            loss = torch.nn.functional.mse_loss(model_pred.float(), noise.float())
+                    else:
+                        model_pred = self.unet(
+                            noisy_latents,
+                            timesteps,
+                            encoder_hidden_states
+                        ).sample
+                        loss = torch.nn.functional.mse_loss(model_pred, noise)
                     
                     # NaN チェック（数値安定性）
                     if torch.isnan(loss):
@@ -517,25 +547,42 @@ class LoRATrainer:
                         optimizer.zero_grad()
                         continue
                     
-                    # バックプロップ
-                    optimizer.zero_grad()
-                    loss.backward()
+                    # 勾配蓄積のためにスケール
+                    loss = loss / gradient_accumulation_steps
                     
-                    # 勾配クリッピング＆チェック
-                    grad_norm = torch.nn.utils.clip_grad_norm_(self.lora_params, 1.0)
-                    if grad_norm > 10.0:
-                        print(f"    ⚠️  High gradient norm: {grad_norm:.4f} at step {global_step}")
+                    # バックプロップ (AMP scaler)
+                    if use_amp:
+                        scaler.scale(loss).backward()
+                    else:
+                        loss.backward()
                     
-                    optimizer.step()
-                    lr_scheduler.step()
+                    # 勾配蓄積ステップ完了時にパラメータ更新
+                    if (batch_idx + 1) % gradient_accumulation_steps == 0 or (batch_idx + 1) == len(dataloader):
+                        if use_amp:
+                            scaler.unscale_(optimizer)
+                        
+                        # 勾配クリッピング＆チェック
+                        grad_norm = torch.nn.utils.clip_grad_norm_(self.lora_params, 1.0)
+                        if grad_norm > 10.0:
+                            print(f"    ⚠️  High gradient norm: {grad_norm:.4f} at step {global_step}")
+                        
+                        if use_amp:
+                            scaler.step(optimizer)
+                            scaler.update()
+                        else:
+                            optimizer.step()
+                        
+                        lr_scheduler.step()
+                        optimizer.zero_grad()
                     
-                    epoch_loss += loss.item()
+                    epoch_loss += loss.item() * gradient_accumulation_steps  # unscale for logging
+                    num_valid_batches += 1
                     global_step += 1
                     
                     pbar.update(1)
                     pbar.set_postfix({"loss": f"{loss.item():.6f}"})
                 
-                avg_loss = epoch_loss / len(dataloader) if len(dataloader) > 0 else float('nan')
+                avg_loss = epoch_loss / num_valid_batches if num_valid_batches > 0 else float('nan')
                 training_log["history"].append({
                     "epoch": epoch + 1,
                     "loss": avg_loss,
