@@ -190,6 +190,85 @@ image = pipe(
 | Mac Mini (MPS) | 30-45秒 | ⭐⭐ 遅い |
 | Mac Mini (CPU) | 2-3分 | ⭐ 非実用的 |
 
+---
+
+## 🧠 Phase 2: LoRA ファインチューニング
+
+Stable Diffusion v1.5 を特定のスタイル（アニメ・印象派風）に特化させるため、**LoRA (Low-Rank Adaptation)** を使用したファインチューニングを実装しました。
+
+### 📊 ステップ1: データセット収集
+
+**Danbooru から 298 枚の画像を自動収集**
+
+```bash
+python scripts/download_danbooru.py --limit 60 --output training_data
+```
+
+**収集結果:**
+- impressionist_style: 60 images (115 MB)
+- oil_painting_aesthetic: 59 images (214 MB)
+- sketch_aesthetic: 60 images (45 MB)
+- soft_focus_landscape: 59 images (170 MB)
+- pastel_softness: 60 images (115 MB)
+
+**データセット検証:**
+```bash
+python scripts/validate_dataset.py --data-dir training_data
+```
+
+### 🎓 ステップ2: LoRA トレーニング
+
+**Google Colab で実行（推奨）:**
+
+```bash
+# 依存パッケージインストール
+!pip install -q diffusers transformers accelerate peft pillow torch tqdm safetensors
+
+# train_lora.py をアップロード
+# training_data/ ディレクトリをアップロード
+
+# トレーニング実行（約1-2時間）
+!python train_lora.py \
+    --data_dir training_data \
+    --output_dir lora_weights \
+    --epochs 50 \
+    --batch_size 1 \
+    --learning_rate 1e-4
+```
+
+**出力:**
+- `lora_weights/anime-impressionist-lora.safetensors` (~4 MB)
+- `lora_weights/training_log.json` (学習履歴)
+
+**ハイパーパラメータ:**
+```
+Model: Stable Diffusion v1.5
+Learning Rate: 1e-4
+Batch Size: 1 (T4 GPU制約)
+Epochs: 50-100
+LoRA Rank: 8
+LoRA Alpha: 32
+```
+
+### 💾 ステップ3: 推論時に LoRA 適用
+
+```python
+from character_generator import AnimeCharacterGenerator
+
+generator = AnimeCharacterGenerator()
+
+# LoRA 重みを適用して生成
+image = generator.generate_image(
+    prompt="1girl, watercolor style, masterpiece",
+    use_lora=True  # LoRA を有効化
+)
+image.save("output.png")
+```
+
+---
+
+## 🎯 パフォーマンス
+
 ## 📚 参考資料
 
 - [Hugging Face Diffusers ドキュメント](https://huggingface.co/docs/diffusers)
