@@ -14,7 +14,7 @@ Anime Impressionist LoRA Training Script
     !python train_lora.py --data_dir /content/training_data --output_dir /content/lora_weights --epochs 100
 
 依存パッケージ:
-    pip install -q diffusers transformers accelerate peft pillow torch tqdm safetensors
+    pip install -q diffusers transformers pillow torch tqdm safetensors
 """
 
 import os
@@ -23,6 +23,7 @@ import json
 from pathlib import Path
 from typing import List, Dict, Optional
 import torch
+import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms
 from PIL import Image
@@ -31,15 +32,89 @@ import traceback
 
 # 条件付きインポート（環境依存）
 try:
-    from diffusers import StableDiffusionPipeline, DDPMScheduler, AutoencoderKL, UNet2DConditionModel
-    from diffusers.models.attention_processor import LoRAAttnProcessor, LoRAAttnProcessor2_0
-    from diffusers.loaders import AttnProcsLayers
+    from diffusers import DDPMScheduler, AutoencoderKL, UNet2DConditionModel
     from transformers import CLIPTokenizer, CLIPTextModel
     from safetensors.torch import save_file
     IMPORTS_SUCCESS = True
 except ImportError as e:
     print(f"⚠️  Some imports failed. Will attempt installation: {e}")
     IMPORTS_SUCCESS = False
+
+
+class LoRALinear(nn.Module):
+    """純粋 PyTorch 実装の LoRA レイヤー
+    
+    バージョン依存なし: PEFT/diffusers の特定 API に依存しない
+    """
+    
+    def __init__(self, linear: nn.Linear, rank: int = 8, alpha: float = 32.0):
+        super().__init__()
+        self.linear = linear
+        in_features = linear.in_features
+        out_features = linear.out_features
+        self.rank = rank
+        self.scale = alpha / rank
+        
+        # LoRA A/B 行列（元の linear と同じ dtype）
+        dtype = linear.weight.dtype
+        self.lora_A = nn.Linear(in_features, rank, bias=False, dtype=dtype)
+        self.lora_B = nn.Linear(rank, out_features, bias=False, dtype=dtype)
+        
+        # 初期化: A は Kaiming 乱数、B はゼロ（初期差分ゼロ）
+        nn.init.kaiming_uniform_(self.lora_A.weight)
+        nn.init.zeros_(self.lora_B.weight)
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.linear(x) + self.scale * self.lora_B(self.lora_A(x))
+
+
+def inject_lora_to_unet(unet: nn.Module, rank: int = 8, alpha: float = 32.0) -> list:
+    """UNet のアテンション層に LoRA を注入
+    
+    Returns:
+        lora_params: 学習対象の LoRA パラメータリスト
+    """
+    unet.requires_grad_(False)
+    lora_modules_replaced = 0
+    
+    for module in unet.modules():
+        # CrossAttention / Attention モジュールの to_k, to_v, to_q を置換
+        for attr in ["to_k", "to_v", "to_q", "to_out"]:
+            child = getattr(module, attr, None)
+            if child is None:
+                continue
+            # to_out はリストのこともある
+            if isinstance(child, nn.ModuleList):
+                for i, sub in enumerate(child):
+                    if isinstance(sub, nn.Linear):
+                        child[i] = LoRALinear(sub, rank=rank, alpha=alpha)
+                        lora_modules_replaced += 1
+            elif isinstance(child, nn.Linear):
+                setattr(module, attr, LoRALinear(child, rank=rank, alpha=alpha))
+                lora_modules_replaced += 1
+    
+    print(f"  🔧 LoRA 注入: {lora_modules_replaced} modules")
+    
+    # LoRA パラメータのみ学習可能に設定
+    lora_params = []
+    for module in unet.modules():
+        if isinstance(module, LoRALinear):
+            module.lora_A.requires_grad_(True)
+            module.lora_B.requires_grad_(True)
+            lora_params.extend(list(module.lora_A.parameters()))
+            lora_params.extend(list(module.lora_B.parameters()))
+    
+    return lora_params
+
+
+def get_lora_state_dict(unet: nn.Module) -> dict:
+    """UNet から LoRA 重みのみ抽出"""
+    state_dict = {}
+    for name, module in unet.named_modules():
+        if isinstance(module, LoRALinear):
+            state_dict[f"{name}.lora_A.weight"] = module.lora_A.weight.detach().cpu().float()
+            state_dict[f"{name}.lora_B.weight"] = module.lora_B.weight.detach().cpu().float()
+    return state_dict
 
 
 class AnimeDataset(Dataset):
@@ -152,7 +227,7 @@ class LoRATrainer:
         self._setup_model()
     
     def _setup_model(self):
-        """モデル・LoRA 設定の初期化 (diffusers ネイティブ LoRA)"""
+        """モデル・LoRA 設定の初期化 (純粋 PyTorch LoRA)"""
         
         try:
             print("\n📥 Loading Stable Diffusion v1.5...")
@@ -160,49 +235,29 @@ class LoRATrainer:
             
             # 各コンポーネントを個別にロード
             self.tokenizer = CLIPTokenizer.from_pretrained(self.model_id, subfolder="tokenizer")
-            self.text_encoder = CLIPTextModel.from_pretrained(self.model_id, subfolder="text_encoder", torch_dtype=dtype).to(self.device)
-            self.vae = AutoencoderKL.from_pretrained(self.model_id, subfolder="vae", torch_dtype=dtype).to(self.device)
-            self.unet = UNet2DConditionModel.from_pretrained(self.model_id, subfolder="unet", torch_dtype=dtype).to(self.device)
+            self.text_encoder = CLIPTextModel.from_pretrained(
+                self.model_id, subfolder="text_encoder", torch_dtype=dtype
+            ).to(self.device)
+            self.vae = AutoencoderKL.from_pretrained(
+                self.model_id, subfolder="vae", torch_dtype=dtype
+            ).to(self.device)
+            self.unet = UNet2DConditionModel.from_pretrained(
+                self.model_id, subfolder="unet", torch_dtype=dtype
+            ).to(self.device)
             
             # VAE とテキストエンコーダーは凍結
             self.vae.requires_grad_(False)
             self.text_encoder.requires_grad_(False)
-            self.unet.requires_grad_(False)
             
-            # diffusers ネイティブ LoRA アテンションプロセッサを設定
-            # PEFT の task_type 依存を一切使わないアプローチ
-            unet_attn_procs = {}
-            for name in self.unet.attn_processors.keys():
-                cross_attention_dim = (
-                    None
-                    if name.endswith("attn1.processor")
-                    else self.unet.config.cross_attention_dim
-                )
-                if name.startswith("mid_block"):
-                    hidden_size = self.unet.config.block_out_channels[-1]
-                elif name.startswith("up_blocks"):
-                    block_id = int(name[len("up_blocks.")])
-                    hidden_size = list(reversed(self.unet.config.block_out_channels))[block_id]
-                elif name.startswith("down_blocks"):
-                    block_id = int(name[len("down_blocks.")])
-                    hidden_size = self.unet.config.block_out_channels[block_id]
-                else:
-                    hidden_size = self.unet.config.block_out_channels[0]
-                
-                unet_attn_procs[name] = LoRAAttnProcessor(
-                    hidden_size=hidden_size,
-                    cross_attention_dim=cross_attention_dim,
-                    rank=self.lora_rank
-                ).to(dtype=dtype, device=self.device)
+            # 純粋 PyTorch LoRA を UNet アテンション層に注入
+            # PEFT / diffusers 特定 API に依存しない（バージョン互換）
+            self.lora_params = inject_lora_to_unet(
+                self.unet, rank=self.lora_rank, alpha=self.lora_alpha
+            )
             
-            self.unet.set_attn_processor(unet_attn_procs)
-            
-            # 学習対象パラメータ: LoRA レイヤーのみ
-            self.lora_layers = AttnProcsLayers(self.unet.attn_processors)
-            
-            lora_params = sum(p.numel() for p in self.lora_layers.parameters())
-            print(f"✅ LoRA configured: {lora_params:,} trainable params")
-            print(f"✅ Model loaded and LoRA configured (diffusers native)")
+            total_params = sum(p.numel() for p in self.lora_params)
+            print(f"✅ LoRA configured: {total_params:,} trainable params")
+            print(f"✅ Model loaded (純粋 PyTorch LoRA, バージョン非依存)")
             
         except Exception as e:
             print(f"❌ Error setting up model: {e}")
@@ -246,9 +301,9 @@ class LoRATrainer:
                 num_workers=num_workers
             )
             
-            # オプティマイザー設定 (LoRA レイヤーのみ)
+            # オプティマイザー設定 (LoRA パラメータのみ)
             optimizer = torch.optim.AdamW(
-                self.lora_layers.parameters(),
+                self.lora_params,
                 lr=learning_rate
             )
             
@@ -263,10 +318,11 @@ class LoRATrainer:
                 self.model_id, subfolder="scheduler"
             )
             
-            # トレーニングループ（LoRA レイヤーのみ学習モード）
-            self.unet.train()
+            # トレーニングモード設定
+            self.unet.train()   # UNet は train モード（LoRAのみ勾配あり）
             self.vae.eval()
             self.text_encoder.eval()
+            # LoRA 以外の UNet パラメータは勾配なし（inject 時に設定済み）
             
             training_log = {
                 "config": {
@@ -336,7 +392,7 @@ class LoRATrainer:
                     # バックプロップ
                     optimizer.zero_grad()
                     loss.backward()
-                    torch.nn.utils.clip_grad_norm_(self.lora_layers.parameters(), 1.0)
+                    torch.nn.utils.clip_grad_norm_(self.lora_params, 1.0)
                     optimizer.step()
                     lr_scheduler.step()
                     
@@ -382,10 +438,9 @@ class LoRATrainer:
         checkpoint_dir = self.output_dir / f"checkpoint-{epoch}"
         checkpoint_dir.mkdir(exist_ok=True)
         
-        # LoRA レイヤーの重みを safetensors で保存
-        state_dict = self.lora_layers.state_dict()
+        state_dict = get_lora_state_dict(self.unet)
         save_file(state_dict, checkpoint_dir / "lora_weights.safetensors")
-        print(f"  💾 Checkpoint saved: {checkpoint_dir}")
+        print(f"  💾 Checkpoint saved: {checkpoint_dir} ({len(state_dict)} tensors)")
     
     def save_lora_weights(self, filename: str = "anime-impressionist-lora.safetensors"):
         """LoRA 重みを SafeTensors フォーマットで保存
@@ -397,24 +452,22 @@ class LoRATrainer:
         save_path = self.output_dir / filename
         
         try:
-            # LoRA アテンションプロセッサの重みのみ抽出して保存
-            state_dict = self.lora_layers.state_dict()
+            state_dict = get_lora_state_dict(self.unet)
             save_file(state_dict, save_path)
             
             file_size_mb = save_path.stat().st_size / (1024 * 1024)
-            print(f"✅ LoRA weights saved: {save_path} ({file_size_mb:.2f} MB)")
+            print(f"✅ LoRA weights saved: {save_path} ({file_size_mb:.2f} MB, {len(state_dict)} tensors)")
             
             # adapter_config.json も保存（互換性のため）
-            import json as _json
             config = {
                 "base_model_name_or_path": self.model_id,
                 "lora_rank": self.lora_rank,
-                "lora_alpha": self.lora_alpha,
-                "target_modules": ["to_k", "to_v", "to_q", "to_out.0"],
-                "peft_type": "LORA"
+                "lora_alpha": float(self.lora_alpha),
+                "target_modules": ["to_k", "to_v", "to_q", "to_out"],
+                "implementation": "pytorch_native"
             }
             with open(self.output_dir / "adapter_config.json", "w") as f:
-                _json.dump(config, f, indent=2)
+                json.dump(config, f, indent=2)
             
             return save_path
         
@@ -484,7 +537,7 @@ def main():
     # ダイナミックインポート (pip install 後)
     if not IMPORTS_SUCCESS:
         print("⚠️  Attempting to install required packages...")
-        os.system("pip install -q diffusers transformers accelerate peft pillow torch tqdm safetensors")
+        os.system("pip install -q diffusers transformers pillow torch tqdm safetensors")
     
     # トレーナー実行
     trainer = LoRATrainer(
