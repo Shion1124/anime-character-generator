@@ -16,14 +16,22 @@ from diffusers import StableDiffusionPipeline
 from PIL import Image, ImageDraw, ImageFont
 import re
 
+# LoRA サポート
+try:
+    from peft import PeftModel
+    LORA_AVAILABLE = True
+except ImportError:
+    LORA_AVAILABLE = False
+
 
 class AnimeCharacterGenerator:
-    def __init__(self, device: str = "auto"):
+    def __init__(self, device: str = "auto", lora_path: str = None):
         """
         初期化
         
         Args:
             device: 実行デバイス ('cuda', 'cpu', or 'auto')
+            lora_path: LoRA 重みファイルパス (オプション)
         """
         if device == "auto":
             self.device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -31,12 +39,19 @@ class AnimeCharacterGenerator:
             self.device = device
             
         self.dtype = torch.float16 if self.device == "cuda" else torch.float32
+        self.lora_path = lora_path
+        self.lora_loaded = False
         
         print(f"📦 Device: {self.device} | Dtype: {self.dtype}")
         print(f"✓ GPU Available: {torch.cuda.is_available()}")
         
         if torch.cuda.is_available():
             print(f"✓ GPU: {torch.cuda.get_device_name(0)}")
+        
+        if lora_path and LORA_AVAILABLE:
+            print(f"📚 LoRA path: {lora_path}")
+        elif lora_path and not LORA_AVAILABLE:
+            print(f"⚠️  LoRA path provided but peft not available")
         
         # モデルロード
         print("\n📦 Loading Stable Diffusion v1.5...")
@@ -88,7 +103,8 @@ class AnimeCharacterGenerator:
         guidance_scale: float = 7.0,
         height: int = 512,
         width: int = 512,
-        seed: int = None
+        seed: int = None,
+        use_lora: bool = False
     ) -> Image.Image:
         """
         単一画像生成
@@ -101,10 +117,18 @@ class AnimeCharacterGenerator:
             height: 画像高さ
             width: 画像幅
             seed: 乱数シード
+            use_lora: LoRA 重みを使用するか
             
         Returns:
             PIL Image
         """
+        # LoRA ロード
+        if use_lora and self.lora_path and LORA_AVAILABLE:
+            if not self.lora_loaded:
+                self._load_lora_weights()
+        elif use_lora and not LORA_AVAILABLE:
+            print("⚠️  LoRA requested but peft not available. Using base model.")
+        
         if seed is not None:
             torch.manual_seed(seed)
         
@@ -117,6 +141,10 @@ class AnimeCharacterGenerator:
                 height=height,
                 width=width
             ).images[0]
+        
+        # LoRA アンロード
+        if use_lora and self.lora_loaded:
+            self._unload_lora_weights()
         
         if output_path:
             os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
@@ -168,6 +196,44 @@ class AnimeCharacterGenerator:
         
         print(f"\n✅ Styles generation complete!")
         return results
+    
+    def _load_lora_weights(self):
+        """LoRA 重みをロード"""
+        if not LORA_AVAILABLE:
+            print("⚠️  peft not available")
+            return
+        
+        if not Path(self.lora_path).exists():
+            print(f"❌ LoRA weights not found: {self.lora_path}")
+            return
+        
+        try:
+            print(f"📚 Loading LoRA weights: {self.lora_path}")
+            
+            # LoRA 重みをロード
+            self.pipe.unet = PeftModel.from_pretrained(
+                self.pipe.unet,
+                self.lora_path
+            )
+            self.lora_loaded = True
+            print("✅ LoRA weights loaded successfully")
+        except Exception as e:
+            print(f"❌ Error loading LoRA: {e}")
+            self.lora_loaded = False
+    
+    def _unload_lora_weights(self):
+        """LoRA 重みをアンロード"""
+        if not self.lora_loaded:
+            return
+        
+        try:
+            # LoRA を削除して元の U-Net に戻す
+            if hasattr(self.pipe.unet, 'disable_adapters'):
+                self.pipe.unet.disable_adapters()
+            self.lora_loaded = False
+            print("✅ LoRA weights unloaded")
+        except Exception as e:
+            print(f"⚠️  Error unloading LoRA: {e}")
     
     def generate_all(self):
         """全パターン生成 + 結果表示"""
@@ -280,11 +346,18 @@ def main():
     parser.add_argument("--all", action="store_true", help="全パターン生成")
     parser.add_argument("--device", choices=["cuda", "cpu"], default="auto",
                        help="実行デバイス")
+    parser.add_argument("--lora-path", type=str, default=None,
+                       help="LoRA 重みファイルパス")
+    parser.add_argument("--use-lora", action="store_true",
+                       help="LoRA 重みを使用（--lora-path で指定）")
     
     args = parser.parse_args()
     
     # ジェネレータ初期化
-    generator = AnimeCharacterGenerator(device=args.device)
+    generator = AnimeCharacterGenerator(
+        device=args.device,
+        lora_path=args.lora_path
+    )
     
     if args.all:
         generator.generate_all()
@@ -294,7 +367,7 @@ def main():
         style_desc = generator.styles[args.style]
         prompt = f"{generator.base_prompt}, {emotion_desc}, {style_desc}"
         print(f"\n🎨 Generating: {args.emotion} + {args.style}")
-        image = generator.generate_image(prompt)
+        image = generator.generate_image(prompt, use_lora=args.use_lora)
         image.show()
     elif args.emotion:
         # 感情のみで生成
