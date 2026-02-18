@@ -33,7 +33,8 @@ import traceback
 try:
     from diffusers import StableDiffusionPipeline, DDPMScheduler
     from transformers import CLIPTokenizer
-    from peft import get_peft_model, LoraConfig
+    from peft import LoraConfig
+    from peft.tuners import inject_adapter_in_model
     from accelerate import Accelerator
     IMPORTS_SUCCESS = True
 except ImportError as e:
@@ -169,7 +170,8 @@ class LoRATrainer:
             self.tokenizer = self.pipe.tokenizer
             
             # LoRA 設定
-            # 注: task_type を指定しない （UNet は言語モデルではなく、prepare_inputs_for_generation を持たない）
+            # 注: get_peft_model ではなく inject_adapter_in_model を使用
+            # get_peft_model は task_type マッピングを使用するため、拡散モデルには適していない
             lora_config = LoraConfig(
                 r=self.lora_rank,
                 lora_alpha=self.lora_alpha,
@@ -178,8 +180,9 @@ class LoRATrainer:
                 bias="none"
             )
             
-            # LoRA を U-Net に適用
-            self.unet = get_peft_model(self.unet, lora_config)
+            # LoRA を U-Net に直接注入（task_type マッピングをバイパス）
+            self.unet = inject_adapter_in_model(self.unet, lora_config)
+            self.unet = self.unet.to(self.device)
             
             print("✅ Model loaded and LoRA configured")
             
