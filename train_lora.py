@@ -399,10 +399,21 @@ class LoRATrainer:
                     # 損失計算（ノイズ予測）
                     loss = torch.nn.functional.mse_loss(model_pred, noise)
                     
+                    # NaN チェック（数値安定性）
+                    if torch.isnan(loss):
+                        print(f"    ⚠️  NaN detected at step {global_step}, skipping batch")
+                        optimizer.zero_grad()
+                        continue
+                    
                     # バックプロップ
                     optimizer.zero_grad()
                     loss.backward()
-                    torch.nn.utils.clip_grad_norm_(self.lora_params, 1.0)
+                    
+                    # 勾配クリッピング＆チェック
+                    grad_norm = torch.nn.utils.clip_grad_norm_(self.lora_params, 1.0)
+                    if grad_norm > 10.0:
+                        print(f"    ⚠️  High gradient norm: {grad_norm:.4f} at step {global_step}")
+                    
                     optimizer.step()
                     lr_scheduler.step()
                     
@@ -412,14 +423,17 @@ class LoRATrainer:
                     pbar.update(1)
                     pbar.set_postfix({"loss": f"{loss.item():.6f}"})
                 
-                avg_loss = epoch_loss / len(dataloader)
+                avg_loss = epoch_loss / len(dataloader) if len(dataloader) > 0 else float('nan')
                 training_log["history"].append({
                     "epoch": epoch + 1,
                     "loss": avg_loss,
                     "lr": optimizer.param_groups[0]["lr"]
                 })
                 
-                print(f"  📊 Epoch Loss: {avg_loss:.6f}")
+                if torch.isnan(torch.tensor(avg_loss)):
+                    print(f"  ⚠️  Epoch Loss: nan (potential training instability)")
+                else:
+                    print(f"  📊 Epoch Loss: {avg_loss:.6f}")
                 
                 # チェックポイント保存
                 if (epoch + 1) % save_interval == 0:
