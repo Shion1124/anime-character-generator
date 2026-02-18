@@ -55,10 +55,11 @@ class LoRALinear(nn.Module):
         self.rank = rank
         self.scale = alpha / rank
         
-        # LoRA A/B 行列（元の linear と同じ dtype）
+        # LoRA A/B 行列（元の linear と同じ dtype / device）
         dtype = linear.weight.dtype
-        self.lora_A = nn.Linear(in_features, rank, bias=False, dtype=dtype)
-        self.lora_B = nn.Linear(rank, out_features, bias=False, dtype=dtype)
+        device = linear.weight.device
+        self.lora_A = nn.Linear(in_features, rank, bias=False, device=device, dtype=dtype)
+        self.lora_B = nn.Linear(rank, out_features, bias=False, device=device, dtype=dtype)
         
         # 初期化: A は Kaiming 乱数、B はゼロ（初期差分ゼロ）
         nn.init.kaiming_uniform_(self.lora_A.weight)
@@ -254,6 +255,15 @@ class LoRATrainer:
             self.lora_params = inject_lora_to_unet(
                 self.unet, rank=self.lora_rank, alpha=self.lora_alpha
             )
+            
+            # 安全策: LoRA 注入後に全パラメータを確実にデバイスへ移動
+            self.unet.to(self.device)
+            # lora_params の参照も更新
+            self.lora_params = []
+            for m in self.unet.modules():
+                if isinstance(m, LoRALinear):
+                    self.lora_params.extend(list(m.lora_A.parameters()))
+                    self.lora_params.extend(list(m.lora_B.parameters()))
             
             total_params = sum(p.numel() for p in self.lora_params)
             print(f"✅ LoRA configured: {total_params:,} trainable params")
