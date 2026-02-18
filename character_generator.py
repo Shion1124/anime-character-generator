@@ -13,8 +13,8 @@ import os
 import torch
 from pathlib import Path
 from diffusers import StableDiffusionPipeline
-from PIL import Image
-import matplotlib.pyplot as plt
+from PIL import Image, ImageDraw, ImageFont
+import re
 
 
 class AnimeCharacterGenerator:
@@ -174,11 +174,10 @@ class AnimeCharacterGenerator:
         emotion_images = self.generate_emotions()
         style_images = self.generate_styles()
         
-        # 感情結果表示
-        self._display_results(emotion_images, "emotion_results.png", rows=2, cols=2)
-        
-        # スタイル結果表示
-        self._display_results(style_images, "style_results.png", rows=2, cols=3)
+        # グリッド形式で合成
+        print("\n📊 Creating composite grid images...")
+        self._create_grid_composite(emotion_images, "emotion_results", rows=2, cols=2)
+        self._create_grid_composite(style_images, "style_results", rows=2, cols=4)
         
         print("\n" + "="*60)
         print("✅ GENERATION COMPLETE!")
@@ -186,31 +185,97 @@ class AnimeCharacterGenerator:
         print(f"\n📁 Generated {len(emotion_images) + len(style_images)} images")
         print(f"📁 Output directory: ./outputs/")
     
+    def _get_next_version(self, base_filename: str) -> str:
+        """
+        ファイルの次のバージョン番号を取得
+        例: style_results_v1.png → style_results_v2.png
+        """
+        output_dir = "./outputs"
+        existing_files = []
+        
+        if os.path.exists(output_dir):
+            existing_files = os.listdir(output_dir)
+        
+        # ベースファイル名に合致するファイルを検索
+        pattern = rf'^{re.escape(base_filename)}_v(\d+)\.png$'
+        versions = []
+        
+        for fn in existing_files:
+            match = re.match(pattern, fn)
+            if match:
+                versions.append(int(match.group(1)))
+        
+        # 次のバージョンは最大値+1、ない場合は1
+        next_version = max(versions) + 1 if versions else 1
+        return f"{base_filename}_v{next_version}.png"
+    
+    def _create_grid_composite(
+        self, 
+        images: dict, 
+        base_filename: str,
+        rows: int = 2, 
+        cols: int = 2,
+        img_size: int = 512,
+        gap: int = 10
+    ):
+        """
+        複数画像をグリッドレイアウトで合成
+        
+        Args:
+            images: {name: PIL.Image} の辞書
+            base_filename: 出力ファイル名（バージョン番号なし）
+            rows: グリッド行数
+            cols: グリッド列数
+            img_size: 各画像のサイズ
+            gap: 画像間のギャップ
+        """
+        os.makedirs("./outputs", exist_ok=True)
+        
+        # 使用する画像を取得（最大 rows*cols）
+        use_images = list(images.items())[:rows*cols]
+        
+        # キャンバスサイズ計算
+        canvas_width = cols * img_size + (cols - 1) * gap + gap * 2
+        canvas_height = rows * img_size + (rows - 1) * gap + gap * 2
+        
+        # キャンバス作成（白背景）
+        canvas = Image.new('RGB', (canvas_width, canvas_height), color='white')
+        
+        # 各画像をペースト
+        for idx, (name, img) in enumerate(use_images):
+            row = idx // cols
+            col = idx % cols
+            
+            # ペースト位置
+            x = gap + col * (img_size + gap)
+            y = gap + row * (img_size + gap)
+            
+            # 画像をリサイズしてペースト
+            resized_img = img.resize((img_size, img_size), Image.Resampling.LANCZOS)
+            canvas.paste(resized_img, (x, y))
+        
+        # 次のバージョン番号を取得して保存
+        output_filename = self._get_next_version(base_filename)
+        output_path = f"./outputs/{output_filename}"
+        
+        canvas.save(output_path, quality=95)
+        print(f"  ✅ Saved: {output_filename}")
+    
     def _display_results(self, images: dict, output_file: str, rows: int, cols: int):
-        """結果画像を表示・保存"""
-        fig, axes = plt.subplots(rows, cols, figsize=(cols*5, rows*5))
-        axes = axes.flatten() if rows * cols > 1 else [axes]
-        
-        for idx, (name, img) in enumerate(list(images.items())[:rows*cols]):
-            axes[idx].imshow(img)
-            axes[idx].set_title(name.upper(), fontsize=12, fontweight='bold')
-            axes[idx].axis('off')
-        
-        # 余った軸を非表示
-        for idx in range(len(images), rows*cols):
-            fig.delaxes(axes[idx])
-        
-        plt.tight_layout()
-        plt.savefig(output_file, dpi=100, bbox_inches='tight')
-        plt.close()
-        print(f"📊 Saved: {output_file}")
+        """結果画像を表示・保存（非推奨：互換性で残す）"""
+        # このメソッドは _create_grid_composite に置き換わった
+        pass
 
 
 def main():
     parser = argparse.ArgumentParser(description="アニメキャラクター自動生成")
     parser.add_argument("--emotion", choices=["happy", "angry", "sad", "surprised"],
                        help="感情を指定")
-    parser.add_argument("--style", choices=["with_hat", "with_earrings", "formal", "casual", "with_makeup", "glasses"],
+    parser.add_argument("--style", 
+                       choices=["with_hat", "with_earrings", "with_makeup", "formal", "casual",
+                               "long_hair", "blush", "fireplace", "warm_lighting", "cozy_room",
+                               "bokeh", "portrait", "depth_of_field", "high_detail", 
+                               "soft_shading", "masterpiece"],
                        help="スタイルを指定")
     parser.add_argument("--all", action="store_true", help="全パターン生成")
     parser.add_argument("--device", choices=["cuda", "cpu"], default="auto",
