@@ -16,9 +16,9 @@
 | **ベースモデル** | `runwayml/stable-diffusion-v1-5` |
 | **パラメータ効率化手法** | LoRA (PEFT) + Latent Space Adaptation |
 | **トレーニングデータ** | Danbooru アニメ画像（スタイル別分類） |
-| **LoRA ランク** | **32** (論文推奨値の1.5倍) |
-| **LoRA アルファ値** | **32** (rank = alpha 相当) |
-| **対象モジュール** | `to_k, to_v, to_q` (Attention層) |
+| **LoRA ランク** | **8** (メモリ効率優先・Colab T4対応) |
+| **LoRA アルファ値** | **32** (alpha/rank=4 でスケーリング) |
+| **対象モジュール** | `to_k, to_v, to_q, to_out.0` (Attention層 Linear のみ) |
 | **学習率** | 1e-4 (Latent Diffusion最適化) |
 | **バッチサイズ** | 2-4 (Colab T4最適化: 16GB VRAM) |
 | **最適化手法** | AdamW (weight_decay=0.01) |
@@ -172,19 +172,19 @@ Danbooru より自動収集・分類されたアニメ画像：
 ### 学習設定（Improvement_Plan.md 準拠）
 
 ```python
-# Phase 2A のハイパーパラメータ
+# v1.5 ノートブック準拠ハイパーパラメータ
 model_config = {
     "model_id": "runwayml/stable-diffusion-v1-5",
-    "lora_rank": 32,
-    "lora_alpha": 32,
+    "lora_rank": 8,        # メモリ効率優先（Colab T4 対応）
+    "lora_alpha": 32,      # スケーリング係数 (alpha/rank = 4)
     "lora_dropout": 0.1,
-    "target_modules": ["to_k", "to_v", "to_q"],  # Attention層
+    "target_modules": ["to_k", "to_v", "to_q", "to_out.0"],  # to_out.0 = Linear のみ
 }
 
 training_config = {
     "learning_rate": 1e-4,
     "batch_size": 2,  # Colab T4 最適化
-    "num_epochs": 50-100,
+    "num_epochs": 10,
     "gradient_accumulation_steps": 1,
     "mixed_precision": "fp16",
     "optimizer": "AdamW",
@@ -230,8 +230,8 @@ Epoch   Loss        Validation
 
 パラメータ削減:
 - フル微調整: 865M パラメータ
-- LoRA適応: 32K パラメータ (0.0037%)
-- ファイルサイズ: ~2-3 MB (フル時: 4GB)
+- LoRA適応 (rank=8): ~8K パラメータ (0.0009%)
+- ファイルサイズ: ~0.5-1 MB (フル時: 4GB)
 ```
 
 ---
@@ -301,10 +301,11 @@ text_encoder = CLIPTextModel.from_pretrained(model_id, subfolder="text_encoder")
 unet = UNet2DConditionModel.from_pretrained(model_id, subfolder="unet")
 
 # LoRA 設定
+# to_out.0 = UNet の to_out ModuleList 内の Linear 層のみを対象
 peft_config = LoraConfig(
-    r=32,
+    r=8,
     lora_alpha=32,
-    target_modules=["to_k", "to_v", "to_q"],
+    target_modules=["to_k", "to_v", "to_q", "to_out.0"],
     lora_dropout=0.1,
     bias="none"
 )
