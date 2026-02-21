@@ -2,6 +2,87 @@
 
 Stable Diffusion + PyTorch を活用した、**アニメキャラクター自動生成システム**。複数の感情・スタイルバリエーションを一度に生成できます。
 
+---
+
+## 📖 プロジェクト進化：v1.0 → v1.5 → v2.0
+
+このプロジェクトは3つのバージョンで段階的に改善されています。
+
+### 🚀 v1.0: PyTorch + Stable Diffusion 基本実装 ✅ 完成
+
+| 特性 | 詳細 |
+|------|------|
+| **ファイル** | `character_generator_v1.py`<br/>`anime_generator_colab_simple_v1.0.ipynb` |
+| **説明** | ブログ [Day3-4 実装記事](https://github.com/Shion1124/anime-character-generator/blob/main/blog_articles/Day3-4_implementation_guide.md) で完全説明 |
+| **機能** | 基本的なテキスト→画像生成<br/>4つの感情 × 16のスタイル生成 |
+| **速度** | 3.8秒/画像 (T4 GPU) |
+| **状態** | ✅ 完成・本番対応済み |
+
+**使用方法**:
+```bash
+python character_generator_v1.py --all
+```
+
+---
+
+### ⚠️ v1.5: LoRA ファインチューニング版（試行版・課題あり）
+
+| 特性 | 詳細 |
+|------|------|
+| **ファイル** | `character_generator_v1_lora.py`<br/>`anime_generator_colab_lora_v1.5.ipynb` |
+| **説明** | ブログのLoRA実装セクション準拠<br/>試行錯誤版として保持 |
+| **機能** | v1.0 + LoRA ファインチューニング<br/>アニメスタイルへの特化 |
+| **速度** | 3.8秒/画像 (v1.0と同じ) |
+| **既知の課題** | ⚠️ 以下4つの課題あり（v2.0で解決予定） |
+
+**既知の課題**:
+
+1. **Character-level noise への脆弱性** ([Gao et al. 2306.13103](https://arxiv.org/abs/2306.13103))
+   - 事例: 「astronaut」→「astornaut」で結果が大きく異なる
+   - 解決: v2.0 Phase 1 で LLM 多層冗長プロンプト実装
+
+2. **推論速度が遅い**
+   - 現在: 3.8秒/画像
+   - 解決: v2.0 Phase 2B で LCM 蒸留 → 1秒/画像を目指す
+
+3. **マルチモーダル入力未対応**
+   - 現在: テキストのみ
+   - 解決: v2.0 Phase 3 で Image-to-Image + ControlNet 実装
+
+4. **本番環境対応なし**
+   - 現在: 研究スクリプト形式
+   - 解決: v2.0 Phase 4 で UI + API + クラウドデプロイ実装
+
+**使用方法**:
+```bash
+python character_generator_v1_lora.py --lora_path ./lora_weights/anime-lora-final --all
+```
+
+---
+
+### ✅ v2.0: 学術的改善版（Phase 1-4 実装中）
+
+| 特性 | 詳細 |
+|------|------|
+| **ファイル** | `character_generator.py`<br/>`anime_generator_colab_lora_v2.0.ipynb` (準備中) |
+| **説明** | Phase 1-4 による段階的改善<br/>論文ベース実装 |
+| **改善内容** | 本ドキュメント下部を参照 |
+| **状態** | 🔄 実装フェーズ |
+
+**Phase 計画**:
+
+| Phase | 目的 | 改善項目 | 期限 |
+|-------|------|---------|------|
+| **Phase 1** | Gao et al. 脆弱性対応 | Gemini LLM 多層冗長プロンプト | Week 1-2 |
+| **Phase 2A** | メモリ効率化 | 改善されたLoRA実装 | Week 2-3 |
+| **Phase 2B** | 推論高速化 | LCM 蒸留（12x高速化） | Week 3-4 |
+| **Phase 3** | マルチモーダル対応 | Image-to-Image + ControlNet | Week 4-5 |
+| **Phase 4** | 本番環境対応 | Streamlit UI + FastAPI + Docker | Week 5-6 |
+
+詳細: [IMPLEMENTATION_ROADMAP.md](./IMPLEMENTATION_ROADMAP.md)
+
+---
+
 ## 📋 プロジェクト概要
 
 このプロジェクトは、Text-to-Image生成モデルの実践的な実装を通じて、以下を実現します：
@@ -269,7 +350,32 @@ image.save("output.png")
 
 ## 🎯 パフォーマンス
 
-## 📚 参考資料
+## � ファイル構成と対応関係
+
+| バージョン | Python Script | Colab Notebook | ブログ対応 | 状態 |
+|-----------|--------------|---|----------|------|
+| **v1.0** | `character_generator_v1.py` | `anime_generator_colab_simple_v1.0.ipynb` | Day3-4前半完全対応 | ✅ 完成 |
+| **v1.5** | `character_generator_v1_lora.py` | `anime_generator_colab_lora_v1.5.ipynb` | Day3-4後半（LoRA）対応 | ⚠️ 課題あり |
+| **v2.0** | `character_generator.py` | `anime_generator_colab_lora_v2.0.ipynb` (準備中) | Phase 1-4 | 🔄 開発中 |
+
+---
+
+## 📚 ドキュメント体系
+
+| ファイル | 説明 |
+|---------|------|
+| [README.md](./README.md) ← **このファイル** | プロジェクト概要・バージョン対応 |
+| [Amendment.md](./Amendment.md) | v1.0/v1.5/v2.0 整合性修正計画 |
+| [IMPLEMENTATION_ROADMAP.md](./IMPLEMENTATION_ROADMAP.md) | v2.0 Phase 1-4 実装計画 |
+| [Improvement_Plan.md](./Improvement_Plan.md) | 理論設計・論文基盤 |
+| [PHASE_1_PROMPT_OPTIMIZATION.md](./PHASE_1_PROMPT_OPTIMIZATION.md) | Phase 1 詳細設計（Gemini LLM） |
+| [PHASE_2B_LCM_DISTILLATION.md](./PHASE_2B_LCM_DISTILLATION.md) | Phase 2B 詳細設計（LCM蒸留） |
+| [PHASE_3_MULTIMODAL.md](./PHASE_3_MULTIMODAL.md) | Phase 3 詳細設計（マルチモーダル） |
+| [PHASE_4_DEPLOYMENT.md](./PHASE_4_DEPLOYMENT.md) | Phase 4 詳細設計（デプロイ） |
+
+---
+
+## �📚 参考資料
 
 - [Hugging Face Diffusers ドキュメント](https://huggingface.co/docs/diffusers)
 - [Stable Diffusion モデルカード](https://huggingface.co/runwayml/stable-diffusion-v1-5)

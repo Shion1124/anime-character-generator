@@ -1,11 +1,26 @@
 #!/usr/bin/env python3
 """
-anime-character-generator
-Stable Diffusion + PyTorch を活用した、アニメキャラクター自動生成
+anime-character-generator v2.0 (Development)
+Stable Diffusion v1.5 + LLM × 論文ベース改善
 
-Usage:
+【バージョン情報】  
+Version: 2.0 (Phase 1-4 実装中)
+Date: 2026-02-19〜
+Status: 改善版 実装フェーズ
+
+【v1.5 からの改善】
+✅ Phase 1: Gemini LLM による多層冗長プロンプト (Gao et al. 対応)
+🔄 Phase 2A: 改善されたメモリ最適化手法による効率化（v1.5とは異なるアプローチ）
+🔄 Phase 2B: LCM 蒸留による 12x 推論高速化
+🔄 Phase 3: Image-to-Image + ControlNet マルチモーダル対応
+🔄 Phase 4: API + UI + クラウドデプロイ
+
+詳細: IMPLEMENTATION_ROADMAP.md, PHASE_[1-4]_*.md 参照
+
+使用例:
     python character_generator.py --emotion happy --style casual
     python character_generator.py --all
+    python character_generator.py --use-robust-prompt --emotion happy --style formal
 """
 
 import argparse
@@ -16,22 +31,22 @@ from diffusers import StableDiffusionPipeline
 from PIL import Image, ImageDraw, ImageFont
 import re
 
-# LoRA サポート
 try:
-    from peft import PeftModel
-    LORA_AVAILABLE = True
+    from prompt_optimizer import RobustPromptGenerator
+    HAS_ROBUST_PROMPT = True
 except ImportError:
-    LORA_AVAILABLE = False
+    HAS_ROBUST_PROMPT = False
+    print("⚠️  RobustPromptGenerator not available. Use --use-robust-prompt to enable.")
 
 
 class AnimeCharacterGenerator:
-    def __init__(self, device: str = "auto", lora_path: str = None):
+    def __init__(self, device: str = "auto", use_robust_prompt: bool = False):
         """
         初期化
         
         Args:
             device: 実行デバイス ('cuda', 'cpu', or 'auto')
-            lora_path: LoRA 重みファイルパス (オプション)
+            use_robust_prompt: RobustPromptGenerator を使用するか
         """
         if device == "auto":
             self.device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -39,19 +54,12 @@ class AnimeCharacterGenerator:
             self.device = device
             
         self.dtype = torch.float16 if self.device == "cuda" else torch.float32
-        self.lora_path = lora_path
-        self.lora_loaded = False
         
         print(f"📦 Device: {self.device} | Dtype: {self.dtype}")
         print(f"✓ GPU Available: {torch.cuda.is_available()}")
         
         if torch.cuda.is_available():
             print(f"✓ GPU: {torch.cuda.get_device_name(0)}")
-        
-        if lora_path and LORA_AVAILABLE:
-            print(f"📚 LoRA path: {lora_path}")
-        elif lora_path and not LORA_AVAILABLE:
-            print(f"⚠️  LoRA path provided but peft not available")
         
         # モデルロード
         print("\n📦 Loading Stable Diffusion v1.5...")
@@ -63,6 +71,17 @@ class AnimeCharacterGenerator:
         self.pipe = self.pipe.to(self.device)
         self.pipe.enable_attention_slicing()
         print("✅ Model ready!")
+        
+        # RobustPromptGenerator 初期化
+        self.robust_prompt_generator = None
+        if use_robust_prompt and HAS_ROBUST_PROMPT:
+            try:
+                print("\n📦 Loading RobustPromptGenerator...")
+                self.robust_prompt_generator = RobustPromptGenerator()
+                print("✅ RobustPromptGenerator ready!")
+            except Exception as e:
+                print(f"⚠️  Failed to load RobustPromptGenerator: {e}")
+                self.robust_prompt_generator = None
         
         # ベースプロンプト
         self.base_prompt = "1girl, anime character, masterpiece, high quality"
@@ -104,7 +123,6 @@ class AnimeCharacterGenerator:
         height: int = 512,
         width: int = 512,
         seed: int = None,
-        use_lora: bool = False
     ) -> Image.Image:
         """
         単一画像生成
@@ -117,17 +135,10 @@ class AnimeCharacterGenerator:
             height: 画像高さ
             width: 画像幅
             seed: 乱数シード
-            use_lora: LoRA 重みを使用するか
             
         Returns:
             PIL Image
         """
-        # LoRA ロード
-        if use_lora and self.lora_path and LORA_AVAILABLE:
-            if not self.lora_loaded:
-                self._load_lora_weights()
-        elif use_lora and not LORA_AVAILABLE:
-            print("⚠️  LoRA requested but peft not available. Using base model.")
         
         if seed is not None:
             torch.manual_seed(seed)
@@ -142,16 +153,98 @@ class AnimeCharacterGenerator:
                 width=width
             ).images[0]
         
-        # LoRA アンロード
-        if use_lora and self.lora_loaded:
-            self._unload_lora_weights()
-        
         if output_path:
             os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
             image.save(output_path)
             print(f"  ✅ Saved: {output_path}")
         
         return image
+    
+    def generate_image_with_optimized_prompt(
+        self,
+        emotion: str,
+        style: str,
+        output_path: str = None,
+        num_inference_steps: int = 20,
+        guidance_scale: float = 7.0,
+        height: int = 512,
+        width: int = 512,
+        seed: int = None,
+    ) -> tuple:
+        """
+        RobustPromptGenerator を使用した最適化プロンプトで画像生成
+        
+        Args:
+            emotion: 感情（"happy", "angry", "sad", "surprised"）
+            style: スタイル（styles 辞書のキー）
+            output_path: 保存先パス
+            num_inference_steps: 推論ステップ数
+            guidance_scale: ガイダンススケール
+            height: 画像高さ
+            width: 画像幅
+            seed: 乱数シード
+        
+        Returns:
+            (PIL.Image, prompt_info) のタプル
+        """
+        
+        if not self.robust_prompt_generator:
+            print("⚠️  RobustPromptGenerator not available, using fallback...")
+            # フォールバック: 通常のプロンプト生成
+            emotion_desc = self.emotions.get(emotion, emotion)
+            style_desc = self.styles.get(style, style)
+            prompt = f"{self.base_prompt}, {emotion_desc}, {style_desc}"
+            
+            image = self.generate_image(
+                prompt=prompt,
+                output_path=output_path,
+                num_inference_steps=num_inference_steps,
+                guidance_scale=guidance_scale,
+                height=height,
+                width=width,
+                seed=seed
+            )
+            
+            return image, {
+                "positive_prompt": prompt,
+                "negative_prompt": "low quality, blurry",
+                "confidence": 0.5,
+                "method": "fallback"
+            }
+        
+        # RobustPromptGenerator でプロンプト生成
+        prompt_info = self.robust_prompt_generator.generate_prompt(
+            emotion=emotion,
+            style=style,
+            quality_level="masterpiece"
+        )
+        
+        final_prompt = prompt_info["positive_prompt"]
+        negative_prompt = prompt_info["negative_prompt"]
+        
+        print(f"\n🤖 Optimized Prompt (Confidence: {prompt_info['confidence']:.2f}):")
+        print(f"  Positive: {final_prompt[:80]}...")
+        print(f"  Negative: {negative_prompt[:80]}...")
+        
+        if seed is not None:
+            torch.manual_seed(seed)
+        
+        with torch.no_grad():
+            image = self.pipe(
+                prompt=final_prompt,
+                negative_prompt=negative_prompt,
+                num_inference_steps=num_inference_steps,
+                guidance_scale=guidance_scale,
+                height=height,
+                width=width
+            ).images[0]
+        
+        if output_path:
+            os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+            image.save(output_path)
+            print(f"  ✅ Saved: {output_path}")
+        
+        return image, prompt_info
     
     def generate_emotions(self, output_dir: str = "./outputs/emotions") -> dict:
         """
@@ -196,44 +289,6 @@ class AnimeCharacterGenerator:
         
         print(f"\n✅ Styles generation complete!")
         return results
-    
-    def _load_lora_weights(self):
-        """LoRA 重みをロード"""
-        if not LORA_AVAILABLE:
-            print("⚠️  peft not available")
-            return
-        
-        if not Path(self.lora_path).exists():
-            print(f"❌ LoRA weights not found: {self.lora_path}")
-            return
-        
-        try:
-            print(f"📚 Loading LoRA weights: {self.lora_path}")
-            
-            # LoRA 重みをロード
-            self.pipe.unet = PeftModel.from_pretrained(
-                self.pipe.unet,
-                self.lora_path
-            )
-            self.lora_loaded = True
-            print("✅ LoRA weights loaded successfully")
-        except Exception as e:
-            print(f"❌ Error loading LoRA: {e}")
-            self.lora_loaded = False
-    
-    def _unload_lora_weights(self):
-        """LoRA 重みをアンロード"""
-        if not self.lora_loaded:
-            return
-        
-        try:
-            # LoRA を削除して元の U-Net に戻す
-            if hasattr(self.pipe.unet, 'disable_adapters'):
-                self.pipe.unet.disable_adapters()
-            self.lora_loaded = False
-            print("✅ LoRA weights unloaded")
-        except Exception as e:
-            print(f"⚠️  Error unloading LoRA: {e}")
     
     def generate_all(self):
         """全パターン生成 + 結果表示"""
@@ -346,29 +401,35 @@ def main():
     parser.add_argument("--all", action="store_true", help="全パターン生成")
     parser.add_argument("--device", choices=["cuda", "cpu"], default="auto",
                        help="実行デバイス")
-    parser.add_argument("--lora-path", type=str, default=None,
-                       help="LoRA 重みファイルパス")
-    parser.add_argument("--use-lora", action="store_true",
-                       help="LoRA 重みを使用（--lora-path で指定）")
+    parser.add_argument("--use-robust-prompt", action="store_true",
+                       help="RobustPromptGenerator (Gemini) を使用して最適化プロンプトを生成")
     
     args = parser.parse_args()
     
     # ジェネレータ初期化
     generator = AnimeCharacterGenerator(
         device=args.device,
-        lora_path=args.lora_path
+        use_robust_prompt=args.use_robust_prompt
     )
     
     if args.all:
         generator.generate_all()
     elif args.emotion and args.style:
         # 特定の感情+スタイルで生成
-        emotion_desc = generator.emotions[args.emotion]
-        style_desc = generator.styles[args.style]
-        prompt = f"{generator.base_prompt}, {emotion_desc}, {style_desc}"
-        print(f"\n🎨 Generating: {args.emotion} + {args.style}")
-        image = generator.generate_image(prompt, use_lora=args.use_lora)
-        image.show()
+        if args.use_robust_prompt and generator.robust_prompt_generator:
+            print(f"\n🎨 Generating: {args.emotion} + {args.style} (with RobustPromptGenerator)")
+            image, prompt_info = generator.generate_image_with_optimized_prompt(
+                emotion=args.emotion,
+                style=args.style
+            )
+            image.show()
+        else:
+            emotion_desc = generator.emotions[args.emotion]
+            style_desc = generator.styles[args.style]
+            prompt = f"{generator.base_prompt}, {emotion_desc}, {style_desc}"
+            print(f"\n🎨 Generating: {args.emotion} + {args.style}")
+            image = generator.generate_image(prompt)
+            image.show()
     elif args.emotion:
         # 感情のみで生成
         generator.generate_emotions()
