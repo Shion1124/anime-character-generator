@@ -144,10 +144,12 @@ class LoRATrainer:
         self.pipe.text_encoder.requires_grad_(False)
         
         # LoRA 設定
+        # "to_out" は ModuleList(Linear + Dropout) のため PEFT 非対応
+        # → "to_out.0" で Linear 層のみを対象にする
         lora_config = LoraConfig(
             r=self.lora_rank,
             lora_alpha=self.lora_alpha,
-            target_modules=["to_k", "to_v", "to_q", "to_out"],
+            target_modules=["to_k", "to_v", "to_q", "to_out.0"],
             lora_dropout=0.1,
             bias="none"
         )
