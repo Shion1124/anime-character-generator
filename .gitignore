@@ -48,6 +48,39 @@ outputs/
 models/
 *.safetensors
 
+# Runtime Caches
+prompt_cache/
+lcm_distilled/
+__pycache__/
+
+################################################################################
+# 📖 EXTERNAL DOCUMENTATION STRUCTURE
+################################################################################
+#
+# 本リポジトリは「コード」に専念し、ドキュメント・計画・ブログは外部管理
+#
+# 外部ディレクトリ（親の ai_projects/）:
+#
+# ✅ project_docs/
+#    ├─ phases/PHASE_1_PROMPT_OPTIMIZATION.md (その他フェーズガイド含む)
+#    └─ setup/PHASE_1_SETUP_GUIDE.md
+#
+# ✅ project_tracking/
+#    ├─ VERSION_2_9_STATUS.md          (日次進捗ダッシュボード)
+#    ├─ IMPLEMENTATION_ROADMAP.md      (42日間の実行計画)
+#    └─ Improvement_Plan.md            (学術設計基礎)
+#
+# ✅ dev_notes/
+#    ├─ dev_peft.md                    (LoRA実装ノート)
+#    └─ interview.md                   (キャリア・応募対策)
+#
+# ✅ blog_articles/blog/
+#    ├─ 0_phase1/BLOG_0_PHASE1.md      (公開ブログ記事)
+#    └─ [その他ブログ]
+#
+# ℹ️  詳細は親ディレクトリの INDEX.md を参照
+#
+################################################################################
 # ログ
 *.log
 webui_startup*.log

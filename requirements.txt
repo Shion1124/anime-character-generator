@@ -1,11 +1,20 @@
-torch>=2.0.0
-torchvision>=0.15.0
-diffusers>=0.21.0
-transformers>=4.34.0
+# Core Deep Learning
+torch>=2.1.0
+torchvision>=0.16.0
+
+# Diffusion Models
+diffusers>=0.25.0
+transformers>=4.35.0
+
+# LoRA & Optimization
+peft>=0.7.0
 accelerate>=0.24.0
+
+# Data & I/O
 safetensors>=0.4.0
 pillow>=10.0.0
+numpy>=1.24.0
+
+# Visualization (optional)
 matplotlib>=3.8.0
-google-generativeai>=0.3.0
-python-dotenv>=1.0.0
-peft>=0.7.0
+tqdm>=4.66.0
