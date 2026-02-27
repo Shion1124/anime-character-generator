@@ -25,15 +25,49 @@ python character_generator_v1.py --all
 
 ---
 
-### ⚠️ v1.5: LoRA ファインチューニング版（試行版・課題あり）
+### 🚀 v2.0B: LCM 蒸留 + LoRA 統合版（Phase 2B 完成版）✅ 完成
+
+| 特性 | 詳細 |
+|------|------|
+| **ファイル** | `character_generator_v2b.py`<br/>`anime_generator_colab_lora_v2b.ipynb` |
+| **説明** | [BLOG_1: Phase 2B LCM蒸留による推論5倍高速化](./blog_articles/blog/BLOG_1_Phase2B_LCM_Distillation.md)|
+| **機能** | LCM スケジューラによる推論高速化<br/>PEFT形式LoRA対応<br/>公式LCM-LoRA統合（guidance=1.5対応）|
+| **速度** | **2.68秒/画像** (float16, T4 GPU実測)<br/>→ **5.0倍高速化**（v1.5比）|
+| **品質** | guidance=7.5 で v1.5 同等品質維持<br/>公式LCM-LoRA使用時は guidance=1.5 で高品質化|
+| **状態** | ✅ 完成・本番推論対応済み |
+
+**推論方法** (ローカル PEFT LoRA):
+```bash
+# Google Drive から lora_weights/ をダウンロード後
+python character_generator_v2b.py \
+  --lora-path ./lora_weights/anime-lora-final \
+  --lcm \
+  --emotion happy --style casual
+
+# 出力: ~1.2秒で高品質画像生成
+```
+
+**推論方法** (公式 LCM-LoRA + anime LoRA):
+```bash
+python character_generator_v2b.py \
+  --lora-path ./lora_weights/anime-lora-final \
+  --official-lcm-lora \
+  --emotion happy --style casual
+
+# 出力: ~1.3秒で Augmented PF-ODE による最高品質生成
+```
+
+---
+
+### ⚠️ v1.5: LoRA ファインチューニング版（参考実装・課題あり）
 
 | 特性 | 詳細 |
 |------|------|
 | **ファイル** | `character_generator_v1_lora.py`<br/>`anime_generator_colab_lora_v1.5.ipynb` |
-| **説明** | ブログのLoRA実装セクション準拠<br/>試行錯誤版として保持 |
+| **説明** | ブログのLoRA実装セクション準拠<br/>v2.0B で解決済み（参考保持） |
 | **機能** | v1.0 + LoRA ファインチューニング<br/>アニメスタイルへの特化 |
 | **速度** | 3.8秒/画像 (v1.0と同じ) |
-| **既知の課題** | ⚠️ 以下4つの課題あり（v2.0で解決予定） |
+| **状態** | ⚠️ 参考用・非推奨（v2.0B を使用） |
 
 **既知の課題**:
 
