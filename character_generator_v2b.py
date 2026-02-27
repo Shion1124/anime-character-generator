@@ -17,8 +17,8 @@ Status: ✅ Phase 2B (LCM蒸留) 完成・本番対応版
 【実装済み (✅)】
 ✅ Phase 2B: LCM 蒸留による推論 5倍高速化 (4ステップ推論)
 ✅ LoRA統合: anime-character-lora_v1.5 対応
-✅ 推論速度: 0.7秒/画像 (完全検証済み)
-✅ 品質: v1.5 と同等品質を維持
+✅ 推論速度: ~1.27秒/画像 (float16, T4実測 — guidance=1.5)
+✅ 品質: 公式 LCM-LoRA + anime LoRA マージで v1.5 同等品質を維持
 
 【バージョン戦略】
 - character_generator_v2b.py: Phase 2B完成版 (このファイル - 参考用・フリーズ)
@@ -56,6 +56,12 @@ from PIL import Image, ImageDraw, ImageFont
 import re
 
 try:
+    from peft import PeftModel
+    HAS_PEFT = True
+except ImportError:
+    HAS_PEFT = False
+
+try:
     from prompt_optimizer import RobustPromptGenerator
     HAS_ROBUST_PROMPT = True
 except ImportError:
@@ -70,7 +76,9 @@ class AnimeCharacterGenerator:
         use_robust_prompt: bool = False,
         use_lora: bool = False,
         use_lcm: bool = False,
-        lora_model_id: str = "yoshihisashinzaki/anime-character-lora_v1.5"
+        lora_model_id: str = "yoshihisashinzaki/anime-character-lora_v1.5",
+        lora_path: str = None,
+        use_official_lcm_lora: bool = False,
     ):
         """
         初期化
@@ -81,6 +89,8 @@ class AnimeCharacterGenerator:
             use_lora: LoRA を統合するか (anime-character-lora_v1.5)
             use_lcm: LCM Scheduler を使用するか (4ステップ高速推論)
             lora_model_id: HuggingFace LoRA モデルID
+            lora_path: ローカル PEFT 形式 anime LoRA ディレクトリパス (例: ./lora_weights/anime-lora-final)
+            use_official_lcm_lora: 公式 LCM-LoRA (latent-consistency/lcm-lora-sdv1-5) を使用
         """
         # デバイス設定
         if device == "auto":
@@ -97,6 +107,8 @@ class AnimeCharacterGenerator:
         self.use_lcm = use_lcm
         self.use_lora = use_lora
         self.lora_model_id = lora_model_id
+        self.lora_path = lora_path
+        self.use_official_lcm_lora = use_official_lcm_lora
         
         print(f"📦 Device: {self.device} | Dtype: {self.dtype}")
         print(f"✓ GPU Available: {torch.cuda.is_available()}")
@@ -116,31 +128,62 @@ class AnimeCharacterGenerator:
         print("✅ Model loaded")
         
         # LoRA 統合 (Phase 2B対応)
-        if use_lora:
-            try:
-                print(f"🎨 Loading LoRA: {lora_model_id}")
-                self.pipe.load_lora_weights(lora_model_id)
-                print("✅ LoRA loaded successfully")
-            except Exception as e:
-                print(f"⚠️  LoRA loading failed: {e}")
-                print("   Continuing with base model only")
+        if use_lora or lora_path:
+            # (A) ローカル PEFT 形式 LoRA（推奨: Google Drive からダウンロード後に使用）
+            _lora_path = Path(lora_path) if lora_path else None
+            if _lora_path and _lora_path.exists():
+                if not HAS_PEFT:
+                    print("⚠️  peft ライブラリがありません: pip install peft")
+                else:
+                    try:
+                        print(f"🎨 PEFT 形式 anime LoRA をロード & マージ: {_lora_path}")
+                        peft_unet = PeftModel.from_pretrained(
+                            self.pipe.unet, str(_lora_path), adapter_name="anime"
+                        )
+                        self.pipe.unet = peft_unet.merge_and_unload()
+                        print("✅ anime LoRA を UNet にマージ完了")
+                    except Exception as e:
+                        print(f"⚠️  PEFT LoRA のマージ失敗: {e}")
+            # (B) HuggingFace hub 上の diffusers 形式 LoRA（フォールバック）
+            elif use_lora:
+                try:
+                    print(f"🎨 HuggingFace LoRA をロード: {lora_model_id}")
+                    self.pipe.load_lora_weights(lora_model_id)
+                    print("✅ LoRA ロード完了")
+                except Exception as e:
+                    print(f"⚠️  LoRA loading failed: {e}")
+                    print("   Continuing with base model only")
         
         # LCM Scheduler 設定 (Phase 2B対応)
-        if use_lcm:
-            print("⚡ Applying LCM Scheduler (4-step inference)")
+        if use_lcm or use_official_lcm_lora:
+            print("⚡ LCMScheduler を適用 (4ステップ推論)")
             try:
                 self.pipe.scheduler = LCMScheduler.from_config(self.pipe.scheduler.config)
                 self.lcm_steps = 4
-                print("✅ LCM Scheduler applied")
+                print("✅ LCMScheduler 適用完了")
             except Exception as e:
                 print(f"⚠️  LCM setup failed: {e}")
                 self.use_lcm = False
                 self.lcm_steps = 20
         else:
             self.lcm_steps = 20
-        
+
+        # 公式 LCM-LoRA (Augmented PF-ODE 搭載 — guidance=1.5 が有効)
+        if use_official_lcm_lora:
+            try:
+                print("📥 公式 LCM-LoRA をロード (latent-consistency/lcm-lora-sdv1-5)...")
+                self.pipe.load_lora_weights(
+                    "latent-consistency/lcm-lora-sdv1-5", adapter_name="lcm"
+                )
+                self.pipe.set_adapters(["lcm"], adapter_weights=[1.0])
+                print("✅ 公式 LCM-LoRA 適用完了")
+                print("   guidance_scale=1.5 を使用してください (Augmented PF-ODE 搭載)")
+            except Exception as e:
+                print(f"⚠️  公式 LCM-LoRA のロード失敗: {e}")
+
         print("✅ Pipeline ready!")
-        print(f"   Configuration: LCM={'✅' if use_lcm else '❌'} | LoRA={'✅' if use_lora else '❌'}")
+        lcm_mode = "公式 LCM-LoRA" if use_official_lcm_lora else ("LCMScheduler" if use_lcm else "❌")
+        print(f"   Configuration: LCM={lcm_mode} | LoRA={'✅' if (use_lora or lora_path) else '❌'}")
         print()
         
         # RobustPromptGenerator 初期化
@@ -499,18 +542,28 @@ def main():
     parser.add_argument("--use-robust-prompt", action="store_true",
                        help="RobustPromptGenerator を使用 (Phase 1)")
     parser.add_argument("--lcm", action="store_true",
-                       help="LCM Scheduler で高速推論 (4ステップ, 5倍高速) [Phase 2B]")
+                       help="LCMScheduler で高速推論 (4ステップ) [Phase 2B]")
     parser.add_argument("--lora", action="store_true",
-                       help="LoRA (anime-character-lora_v1.5) を統合 [Phase 2B]")
+                       help="HuggingFace 上の diffusers 形式 LoRA を統合 [Phase 2B]")
+    parser.add_argument("--lora-path", type=str, default=None, dest="lora_path",
+                       metavar="DIR",
+                       help="ローカル PEFT 形式 anime LoRA ディレクトリ (例: ./lora_weights/anime-lora-final)")
+    parser.add_argument("--official-lcm-lora", action="store_true", dest="official_lcm_lora",
+                       help="公式 LCM-LoRA (latent-consistency/lcm-lora-sdv1-5) を使用【推奨: guidance=1.5 が有効】")
     
     args = parser.parse_args()
     
     # ジェネレータ初期化
+    # LCM モードのデフォルト guidance を設定
+    default_guidance = 1.5 if (args.lcm or args.official_lcm_lora) else 7.0
+
     generator = AnimeCharacterGenerator(
         device=args.device,
         use_robust_prompt=args.use_robust_prompt,
         use_lcm=args.lcm,
-        use_lora=args.lora
+        use_lora=args.lora,
+        lora_path=args.lora_path,
+        use_official_lcm_lora=args.official_lcm_lora,
     )
     
     if args.all:
@@ -521,9 +574,11 @@ def main():
         style_desc = generator.styles[args.style]
         prompt = f"{generator.base_prompt}, {emotion_desc}, {style_desc}"
         print(f"\n🎨 Generating: {args.emotion} + {args.style}")
-        if args.lcm:
-            print(f"   (LCM: 4 steps, ~0.7s)")
-        image, elapsed = generator.generate_image(prompt)
+        if args.official_lcm_lora:
+            print(f"   (公式 LCM-LoRA: 4 steps, ~1.3s, guidance=1.5)")
+        elif args.lcm:
+            print(f"   (LCMScheduler: 4 steps, ~1.3s)")
+        image, elapsed = generator.generate_image(prompt, guidance_scale=default_guidance)
         image.show()
     elif args.emotion:
         # 感情のみで生成
