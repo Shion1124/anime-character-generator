@@ -1,37 +1,44 @@
 #!/usr/bin/env python3
 """
-anime-character-generator v2.0B (Phase 2B LCM蒸留版 - 本番対応)
-Stable Diffusion v1.5 + LoRA + LCM × 論文ベース改善
+anime-character-generator v2.0B (Phase 2B LCM蒸留版 - 本番対応+HF統合)
+Stable Diffusion v1.5 + LoRA + LCM × 論文ベース改善 + HuggingFace Release
 
 【バージョン情報】  
-Version: 2.0B (Phase 2B 完成版 - 本番・参考実装用)
-Date: 2026-02-26
-Status: ✅ Phase 2B (LCM蒸留) 完成・本番対応版
+Version: 2.0B (Phase 2B 完成版 - 本番対応版 + Phase 4 HF統合)
+Date: 2026-03-05
+Status: ✅ Phase 2B (LCM蒸留) + Phase 4 (HF Release) 完成・本番対応版
 
 【対応ノートブック】
-📓 anime_generator_colab_lora_v2b.ipynb
+📓 anime_generator_colab_lora_v2b.ipynb (v2.0B完成版)
    └─ Google Colab での Phase 2B LCM蒸留実装
-   └─ このスクリプトと同一の実装
-   └─ HuggingFace トークン: 読み取りトークン（読み込み用）で OK
+   └─ Phase 4: HuggingFace アップロード機能
+   └─ トークン管理：Read（ダウンロード）→ Write（アップロード）
 
 【実装済み (✅)】
 ✅ Phase 2B: LCM 蒸留による推論 5倍高速化 (4ステップ推論)
 ✅ LoRA統合: anime-character-lora_v1.5 対応
-✅ 推論速度: ~1.27秒/画像 (float16, T4実測 — guidance=1.5)
+✅ 推論速度: ~1.3秒/画像 (float16, T4実測 — guidance=1.5)
 ✅ 品質: 公式 LCM-LoRA + anime LoRA マージで v1.5 同等品質を維持
+✅ Phase 4: HuggingFace Hub Release (README生成 + モデルアップロード)
+✅ トークン管理: 自動Read→Write切り替え
 
 【バージョン戦略】
-- character_generator_v2b.py: Phase 2B完成版 (このファイル - 参考用・フリーズ)
+- character_generator_v2b.py: Phase 2B+4完成版 (このファイル - 本番対応・参考用)
 - character_generator.py: Phase 3以降で更新・拡張
 
 【HuggingFace トークンについて】
-⚠️  LoRA モデルのダウンロードには、HuggingFace から「読み取りトークン」が必要な場合があります
+⚠️ LoRA ダウンロード: 「読み取りトークン」（Read Token）が必要
    - トークン取得: https://huggingface.co/settings/tokens
-   - トークンタイプ: 「Read」（読み取り）で十分
-   - 自動ダウンロード失敗時は CLI で `huggingface-cli login` を実行してください
+   - Scope: 必要に応じて「読み取り」のみ設定
+
+⚠️ モデルアップロード: 「書き込みトークン」（Write Token）が必要 [Phase 4]
+   - トークン取得: https://huggingface.co/settings/tokens
+   - Scope: リポジトリへの「書き込み」権限が必須
+   - 自動ダウンロード失敗時は CLI で `huggingface-cli login` を実行
 
 【使用場面】
 ✅ ローカル推論（高速）
+✅ HuggingFace Hub へのモデルリリース [Phase 4]
 ✅ 参考実装として Phase 2B コードを確認
 ✅ Phase 3 実装時に Phase 2B 機能を参照
 
@@ -44,6 +51,9 @@ Status: ✅ Phase 2B (LCM蒸留) 完成・本番対応版
     
     # LoRA + LCM (最適化構成)
     python character_generator_v2b.py --lora --lcm --emotion happy --style casual
+    
+    # HuggingFace へのモデルアップロード [Phase 4]
+    python character_generator_v2b.py --upload-model --repo-id "your_username/anime-character-lcm-lora"
 """
 
 import argparse

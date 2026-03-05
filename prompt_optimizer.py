@@ -1,24 +1,26 @@
 #!/usr/bin/env python3
 """
-LLM ベースの堅牢なプロンプト生成エンジン（HuggingFace / Qwen3-Swallow）
+LLM ベースの堅牢なプロンプト生成エンジン
 
 Gao et al. (2306.13103) による脆弱性研究に基づき、タイポ・グリフ攻撃などの
 文字レベルのノイズに対する耐性を強化したプロンプト設計を実装。
 
-オープンソース版: HuggingFace + Qwen3-Swallow-8B により 100% 無料・オフライン対応
-- Model: Qwen3-Swallow-8B-RL-v0.2 (日本語対応、高性能)
-- ソース: https://huggingface.co/tokyotech-llm/Qwen3-Swallow-8B-RL-v0.2
-- 推論フレームワーク: transformers + torch
+対応パイプライン:
+- ✅ Text-to-Image: 公式 LCM-LoRA + anime LoRA
+- ✅ Image-to-Image: スケッチ → 着彩（ControlNet統合）
+- ✅ ControlNet + Animation: 複数フレーム生成
 
 背景：Gao et al. は、Text-to-Image モデルが「A photo of an astronaut」を
 「A photo of an astornaut」（タイポ）に変えるだけで生成結果が劇的に変わる
-ことを実験で証明した。このガイドでは、複数の類似トークンを使用することで
-この脆弱性を軽減するアプローチを採用している。
+ことを実験で証明した。LCM-LoRA では1-4ステップという少ないステップで生成する
+ため、入力プロンプトの堅牢性がより重要になります。複数の類似トークンを使用
+することでこの脆弱性を軽減します。
 
 使用例:
     generator = RobustPromptGenerator()
-    result = generator.generate_prompt("happy", "formal dress")
+    result = generator.generate_prompt("happy", "anime character", use_lcm=True)
     print(result["positive_prompt"])
+    print(result["lcm_settings"])  # {"guidance_scale": 1.5, "num_inference_steps": 4}
 """
 
 import torch
